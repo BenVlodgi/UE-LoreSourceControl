@@ -1,0 +1,13 @@
+# Ignore every dotfile and dotfolder (.vs, .vsconfig, .idea, .lore, ...)
+.*
+!.gitignore
+
+# Unreal build output
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+
+# Built data for maps
+*_BuiltData.uasset

@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "Lore",
+	"Description": "Lore version control integration for the editor's Revision Control system.",
+	"Category": "Source Control",
+	"CreatedBy": "Benjamin Thomas Blodgett, Dream Seed LLC",
+	"CreatedByURL": "https://benvlodgi.github.io/",
+	"DocsURL": "",
+	"MarketplaceURL": "https://github.com/BenVlodgi/UE-LoreSourceControl",
+	"SupportURL": "https://github.com/BenVlodgi/UE-LoreSourceControl/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "LoreSourceControl",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
