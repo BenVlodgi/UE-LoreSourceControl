@@ -57,6 +57,9 @@ Download and extract `LoreSourceControl` into your project's `Plugins/` director
 ### 3. Set Lore as Revision Control Provider
 
 In the Unreal Engine Editor, open **Revision Control**, pick **Lore**.
+<img width="626" height="240" alt="image" src="https://github.com/user-attachments/assets/0da9a020-7886-4cb8-b4df-110b45e22959" />
+<img width="406" height="173" alt="image" src="https://github.com/user-attachments/assets/a63bc7cd-d987-4695-b54a-0cbbfd9877bd" />
+
 
 #### 3.1 Ensure the Lore CLI is Available
 
