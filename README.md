@@ -20,13 +20,21 @@
 
 <p>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-informational"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-4.27-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.0-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.1-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.2-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.3-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.4-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.5-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.6-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.7-green?logo=unrealengine"></a>
+  <a href=""><img alt="License: MIT" src="https://img.shields.io/badge/UE-5.8-green?logo=unrealengine"></a>
 </p>
 
 </div>
 
 Unreal Engine Plugin adds support for [Lore](https://lore.org) Version Control System.
-
-Compatible with UE 4.27 - UE 5.8.
 
 > [!NOTE]
 > Lore is pre-1.0 and under active development. Interfaces, on-disk formats, and APIs may change between releases.
