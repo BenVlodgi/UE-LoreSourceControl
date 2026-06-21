@@ -28,14 +28,23 @@ void FLoreSourceControlModule::StartupModule()
 	Provider.RegisterWorker("Revert", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreRevertWorker>));
 	Provider.RegisterWorker("Sync", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreSyncWorker>));
 	Provider.RegisterWorker("CheckIn", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCheckInWorker>));
+	Provider.RegisterWorker("CheckInOverLock", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCheckInOverLockWorker>));
 	Provider.RegisterWorker("Copy", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCopyWorker>));
 	Provider.RegisterWorker("Resolve", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreResolveWorker>));
 
 	IModularFeatures::Get().RegisterModularFeature("SourceControl", &Provider);
+
+#if WITH_EDITOR && LORE_UE5_1_OR_LATER
+	AssetMenu.Register();
+#endif
 }
 
 void FLoreSourceControlModule::ShutdownModule()
 {
+#if WITH_EDITOR && LORE_UE5_1_OR_LATER
+	AssetMenu.Unregister();
+#endif
+
 	Provider.Close();
 	IModularFeatures::Get().UnregisterModularFeature("SourceControl", &Provider);
 }

@@ -6,6 +6,8 @@
 #include "Modules/ModuleManager.h"
 #include "LoreSourceControlSettings.h"
 #include "LoreSourceControlProvider.h"
+#include "LoreSourceControlVersion.h"
+#include "LoreSourceControlMenu.h"
 
 class FLoreSourceControlModule : public IModuleInterface
 {
@@ -33,4 +35,7 @@ public:
 private:
 	FLoreSourceControlSettings Settings;
 	FLoreSourceControlProvider Provider;
+#if WITH_EDITOR && LORE_UE5_1_OR_LATER
+	FLoreSourceControlMenu AssetMenu;
+#endif
 };

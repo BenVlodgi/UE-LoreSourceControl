@@ -105,7 +105,13 @@ FSlateIcon FLoreSourceControlState::GetIcon() const
 		{
 			return FSlateIcon(StyleSet, "RevisionControl.CheckedOut");
 		}
+		// Changed on disk without holding the lock (for example after Make Writable); not a check out.
+#if LORE_UE5_3_OR_LATER
+		return FSlateIcon(StyleSet, "RevisionControl.ModifiedLocally");
+#else
+		// The ModifiedLocally brush is first registered in 5.3; 5.2 has no modified icon, so use CheckedOut.
 		return FSlateIcon(StyleSet, "RevisionControl.CheckedOut");
+#endif
 	default:
 		if (LockState == ELoreLockState::Locked)
 		{
@@ -135,6 +141,12 @@ FText FLoreSourceControlState::GetDisplayName() const
 		return FText::Format(LOCTEXT("LockedOther", "Checked out by {0}"), FText::FromString(LockUser));
 	}
 
+	// A held lock with no edits still reads as checked out, matching the icon.
+	if (LockState == ELoreLockState::Locked && WorkingCopyState == ELoreWorkingCopyState::Unchanged)
+	{
+		return LOCTEXT("CheckedOut", "Checked out");
+	}
+
 	switch (WorkingCopyState)
 	{
 	case ELoreWorkingCopyState::Unchanged:     return LOCTEXT("Unchanged", "Unchanged");
@@ -152,17 +164,33 @@ FText FLoreSourceControlState::GetDisplayName() const
 
 FText FLoreSourceControlState::GetDisplayTooltip() const
 {
+	// List every condition that applies: the engine shows this in the warning and status columns, not only on hover.
+	TArray<FText> Parts;
 	if (LockState == ELoreLockState::LockedOther)
 	{
-		return FText::Format(LOCTEXT("LockedOtherTooltip", "Locked for edit by {0}"), FText::FromString(LockUser));
+		Parts.Add(FText::Format(LOCTEXT("LockedOtherTooltip", "Locked for edit by {0}"), FText::FromString(LockUser)));
+	}
+	else if (LockState == ELoreLockState::Locked)
+	{
+		Parts.Add(LOCTEXT("LockedMineTooltip", "Checked out by you"));
+	}
+
+	if (IsConflicted())
+	{
+		Parts.Add(LOCTEXT("ConflictedTooltip", "This file has an unresolved conflict"));
 	}
 
 	if (!IsCurrent())
 	{
-		return LOCTEXT("NotCurrentTooltip", "The server holds a newer revision of this file");
+		Parts.Add(LOCTEXT("NotCurrentTooltip", "The server holds a newer revision of this file"));
 	}
 
-	return GetDisplayName();
+	if (Parts.Num() == 0)
+	{
+		return GetDisplayName();
+	}
+
+	return FText::Join(FText::FromString(TEXT(". ")), Parts);
 }
 
 const FString& FLoreSourceControlState::GetFilename() const { return LocalFilename; }
@@ -170,7 +198,8 @@ const FDateTime& FLoreSourceControlState::GetTimeStamp() const { return TimeStam
 
 bool FLoreSourceControlState::CanCheckIn() const
 {
-	if (IsConflicted() || !IsCurrent())
+	// A behind-the-remote file still submits: the commit is local and the row warns through IsCurrent. Only an unresolved conflict blocks.
+	if (IsConflicted())
 	{
 		return false;
 	}

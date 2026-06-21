@@ -37,16 +37,21 @@ namespace
 		return Extension.Equals(TEXT("uasset"), ESearchCase::IgnoreCase) || Extension.Equals(TEXT("umap"), ESearchCase::IgnoreCase);
 	}
 
-	// Restore read-only on tracked binary assets whose lock released.
-	void RestoreReadOnlyFromStates(const TArray<FLoreSourceControlState>& InStates)
+	// Keep binary assets read-only unless user holds the lock; Lore doesn't set read-only itself.
+	void ApplyReadOnlyFromStates(const TArray<FLoreSourceControlState>& InStates)
 	{
 		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 		for (const FLoreSourceControlState& State : InStates)
 		{
-			if (State.LockState == ELoreLockState::NotLocked && State.IsSourceControlled() && IsLockableAsset(State.LocalFilename) && PlatformFile.FileExists(*State.LocalFilename))
+			if (!IsLockableAsset(State.LocalFilename) || !PlatformFile.FileExists(*State.LocalFilename))
 			{
-				PlatformFile.SetReadOnly(*State.LocalFilename, true);
+				continue;
 			}
+			const bool bCommitted = State.WorkingCopyState == ELoreWorkingCopyState::Unchanged
+				|| State.WorkingCopyState == ELoreWorkingCopyState::Modified
+				|| State.WorkingCopyState == ELoreWorkingCopyState::Conflicted;
+			const bool bReadOnly = bCommitted && State.LockState != ELoreLockState::Locked;
+			PlatformFile.SetReadOnly(*State.LocalFilename, bReadOnly);
 		}
 	}
 }
@@ -63,6 +68,7 @@ bool FLoreConnectWorker::Execute(FLoreSourceControlCommand& InCommand)
 	{
 		LoreSourceControlUtils::GetRepositoryConfig(RepositoryRoot, RemoteUrl, Identity);
 		LoreSourceControlUtils::GetBranchName(InCommand.PathToLoreBinary, RepositoryRoot, BranchName);
+		LoreSourceControlUtils::GetRemoteAuthState(InCommand.PathToLoreBinary, RepositoryRoot, bRemoteAvailable, bRemoteAuthorized);
 	}
 
 	InCommand.bCommandSuccessful = bAvailable && bRepositoryFound;
@@ -80,7 +86,9 @@ bool FLoreConnectWorker::Execute(FLoreSourceControlCommand& InCommand)
 
 bool FLoreConnectWorker::UpdateStates() const
 {
-	FLoreSourceControlModule::Get().GetProvider().SetRepositoryInfo(bAvailable, bRepositoryFound, RepositoryRoot, RemoteUrl, Identity, BranchName, RepositoryId, LoreVersion);
+	FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+	Provider.SetRepositoryInfo(bAvailable, bRepositoryFound, RepositoryRoot, RemoteUrl, Identity, BranchName, RepositoryId, LoreVersion);
+	Provider.SetRemoteAuthState(bRemoteAvailable, bRemoteAuthorized);
 	return false;
 }
 
@@ -97,6 +105,12 @@ bool FLoreUpdateStatusWorker::Execute(FLoreSourceControlCommand& InCommand)
 	}
 
 	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, InCommand.ErrorMessages, States);
+
+	// Re-assert read-only each status pass, since Lore never sets it itself.
+	if (InCommand.bUsingLocking)
+	{
+		ApplyReadOnlyFromStates(States);
+	}
 
 	const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> Operation = StaticCastSharedRef<FUpdateStatus>(InCommand.Operation);
 	if (Operation->ShouldUpdateHistory())
@@ -200,15 +214,24 @@ bool FLoreRevertWorker::Execute(FLoreSourceControlCommand& InCommand)
 	LoreSourceControlUtils::RunCommand(TEXT("unstage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
 	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
 
-	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking)
-	{
-		LoreSourceControlUtils::RunCommand(TEXT("lock release"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
-	}
-
 	RefreshStates(InCommand, States);
 	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking)
 	{
-		RestoreReadOnlyFromStates(States);
+		// Release only locks this user holds; reverting an added file leaves an untracked path that was never locked, which release would error on.
+		TArray<FString> LockedRelative;
+		for (FLoreSourceControlState& State : States)
+		{
+			if (State.LockState == ELoreLockState::Locked)
+			{
+				LockedRelative.Add(LoreSourceControlUtils::RelativeFilename(State.LocalFilename, InCommand.PathToRepositoryRoot));
+				State.LockState = ELoreLockState::NotLocked;
+			}
+		}
+		if (LockedRelative.Num() > 0)
+		{
+			LoreSourceControlUtils::RunCommand(TEXT("lock release"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), LockedRelative, Results, InCommand.ErrorMessages);
+		}
+		ApplyReadOnlyFromStates(States);
 	}
 	return InCommand.bCommandSuccessful;
 }
@@ -237,12 +260,29 @@ bool FLoreSyncWorker::UpdateStates() const
 
 // CheckIn ---------------------------------------------------------------------
 
-FName FLoreCheckInWorker::GetName() const { return "CheckIn"; }
-
-bool FLoreCheckInWorker::Execute(FLoreSourceControlCommand& InCommand)
+/**
+ * Shared check-in body for the normal and force-over-lock submit paths.
+ *
+ * @param InCommand       Command carrying the files, identity, and settings to submit.
+ * @param States          Receives the file states refreshed after the submit.
+ * @param bForceOverLock  When true, the submit proceeds over a foreign lock and does not release a lock this user never held.
+ * @return                True when the commit, and any push, succeeded.
+ */
+static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceControlState>& States, bool bForceOverLock)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
 	TArray<FString> Results;
+
+	// Guard on a fresh status: refuse before staging if a submitted file is locked by another (unless forcing over it) or conflicted. A behind-the-remote file is allowed; its commit is local and a rejected push is reported.
+	TArray<FLoreSourceControlState> GuardStates;
+	TArray<FString> GuardErrors;
+	LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, GuardErrors, GuardStates);
+	if (LoreSourceControlUtils::CollectCheckInBlockers(GuardStates, bForceOverLock, InCommand.ErrorMessages))
+	{
+		InCommand.bCommandSuccessful = false;
+		RefreshStates(InCommand, States);
+		return false;
+	}
 
 	// Lore commits the whole staged set, so unstage everything, then stage only our files. Unstage errors are cleanup, keep them out of the user-facing list.
 	TArray<FString> UnstageErrors;
@@ -308,12 +348,12 @@ bool FLoreCheckInWorker::Execute(FLoreSourceControlCommand& InCommand)
 	// FCheckIn gained the flag in 5.1; earlier editors always release on submit.
 	const bool bKeepCheckedOut = false;
 #endif
-	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking && !bKeepCheckedOut)
+	// Do not release a lock held by someone else when forcing over it; we never held it.
+	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking && !bKeepCheckedOut && !bForceOverLock)
 	{
 		LoreSourceControlUtils::RunCommand(TEXT("lock release"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
 	}
 
-	// Make the success message specific: count, description, and file names.
 	if (InCommand.bCommandSuccessful)
 	{
 		TArray<FString> Names;
@@ -332,12 +372,33 @@ bool FLoreCheckInWorker::Execute(FLoreSourceControlCommand& InCommand)
 	RefreshStates(InCommand, States);
 	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking)
 	{
-		RestoreReadOnlyFromStates(States);
+		ApplyReadOnlyFromStates(States);
 	}
 	return InCommand.bCommandSuccessful;
 }
 
+FName FLoreCheckInWorker::GetName() const { return "CheckIn"; }
+
+bool FLoreCheckInWorker::Execute(FLoreSourceControlCommand& InCommand)
+{
+	return RunCheckIn(InCommand, States, /*bForceOverLock*/ false);
+}
+
 bool FLoreCheckInWorker::UpdateStates() const
+{
+	return LoreSourceControlUtils::UpdateCachedStates(States);
+}
+
+// CheckInOverLock -------------------------------------------------------------
+
+FName FLoreCheckInOverLockWorker::GetName() const { return "CheckInOverLock"; }
+
+bool FLoreCheckInOverLockWorker::Execute(FLoreSourceControlCommand& InCommand)
+{
+	return RunCheckIn(InCommand, States, /*bForceOverLock*/ true);
+}
+
+bool FLoreCheckInOverLockWorker::UpdateStates() const
 {
 	return LoreSourceControlUtils::UpdateCachedStates(States);
 }

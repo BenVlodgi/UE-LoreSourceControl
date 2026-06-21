@@ -50,7 +50,7 @@ public:
 	/** Commit author identity. */
 	FString UserName;
 
-	/** Action recorded for this file in this revision (added, modified, deleted). */
+	/** Action label shown in file history for this revision (Add, Keep (Edit), Delete, Move, Copy). */
 	FString Action;
 
 	/** Commit timestamp. */

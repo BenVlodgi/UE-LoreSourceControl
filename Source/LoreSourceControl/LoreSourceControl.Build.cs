@@ -12,6 +12,7 @@ public class LoreSourceControl : ModuleRules
 			new string[]
 			{
 				"Core",
+				"Json",
 				"Slate",
 				"SlateCore",
 				"InputCore",
@@ -35,6 +36,9 @@ public class LoreSourceControl : ModuleRules
 			if (Target.Version.MajorVersion >= 5)
 			{
 				PrivateDependencyModuleNames.Add("EditorFramework");
+				// The "Check in over lock" asset menu uses ToolMenus and the Content Browser, gated to UE5.
+				PrivateDependencyModuleNames.Add("ToolMenus");
+				PrivateDependencyModuleNames.Add("ContentBrowser");
 			}
 		}
 	}

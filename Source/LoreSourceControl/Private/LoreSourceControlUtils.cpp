@@ -11,11 +11,84 @@
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 #include "Interfaces/IPluginManager.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 namespace LoreSourceControlConstants
 {
 	// Validated client version
 	const TCHAR* PinnedVersion = TEXT("0.8.3");
+}
+
+// The Lore --json event vocabulary in one place, so a mistyped key fails the build instead of parsing to nothing at runtime.
+namespace LoreJson
+{
+	// Event envelope: every line is { "tagName": <event>, "data": { ... } }.
+	const FString TagName = TEXT("tagName");
+	const FString Data = TEXT("data");
+
+	// Values the envelope "tagName" takes.
+	namespace Tags
+	{
+		const FString RepositoryStatusRevision = TEXT("repositoryStatusRevision");
+		const FString RepositoryStatusFile = TEXT("repositoryStatusFile");
+		const FString LockFileStatus = TEXT("lockFileStatus");
+		const FString FileHistory = TEXT("fileHistory");
+		const FString Metadata = TEXT("metadata");
+	}
+
+	// repositoryStatusRevision fields.
+	const FString IsRemoteAhead = TEXT("isRemoteAhead");
+	const FString RemoteAvailable = TEXT("remoteAvailable");
+	const FString RemoteAuthorized = TEXT("remoteAuthorized");
+
+	// repositoryStatusFile fields.
+	const FString Type = TEXT("type");
+	const FString TypeDirectory = TEXT("directory");
+	const FString Path = TEXT("path");
+	const FString Action = TEXT("action");
+	const FString FlagStaged = TEXT("flagStaged");
+	const FString FlagDirty = TEXT("flagDirty");
+	const FString FlagConflict = TEXT("flagConflict");
+	const FString FlagConflictUnresolved = TEXT("flagConflictUnresolved");
+
+	// Values the "action" field takes.
+	namespace ActionValues
+	{
+		const FString Add = TEXT("add");
+		const FString Keep = TEXT("keep");
+		const FString Delete = TEXT("delete");
+		const FString Move = TEXT("move");
+		const FString Copy = TEXT("copy");
+	}
+
+	// lockFileStatus fields; "path" is shared with the status file event.
+	const FString Owner = TEXT("owner");
+
+	// fileHistory fields; "action" is shared with the status file event.
+	const FString Revision = TEXT("revision");
+	const FString RevisionNumber = TEXT("revisionNumber");
+
+	// metadata fields; each value is itself a tagged object whose "data" carries the payload.
+	const FString Key = TEXT("key");
+	const FString Value = TEXT("value");
+
+	// Values the metadata "key" takes.
+	namespace MetadataKeys
+	{
+		const FString Timestamp = TEXT("timestamp");
+		const FString Message = TEXT("message");
+		const FString CommittedBy = TEXT("committed-by");
+		const FString CreatedBy = TEXT("created-by");
+	}
+}
+
+// The .lore/config.toml keys the connect path reads.
+namespace LoreConfig
+{
+	const FString RemoteUrl = TEXT("remote_url");
+	const FString Identity = TEXT("identity");
 }
 
 namespace
@@ -88,114 +161,178 @@ namespace
 		return false;
 	}
 
-	// Current section of `lore status` output.
-	enum class EStatusSection
+	// Parse `--json` event line into its tag and data object.
+	bool ParseJsonEvent(const FString& InLine, FString& OutTag, TSharedPtr<FJsonObject>& OutData)
 	{
-		None,
-		Untracked,
-		NotStaged,
-		Staged,
-	};
-
-	ELoreWorkingCopyState::Type ActionLetterToState(const TCHAR Letter, EStatusSection Section)
-	{
-		// Untracked files are not source controlled, though the scan letters them added.
-		if (Section == EStatusSection::Untracked)
+		const FString Trimmed = InLine.TrimStartAndEnd();
+		if (Trimmed.IsEmpty() || Trimmed[0] != TEXT('{'))
 		{
-			return ELoreWorkingCopyState::NotControlled;
+			return false;
 		}
-
-		switch (Letter)
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Trimmed);
+		TSharedPtr<FJsonObject> Object;
+		if (!FJsonSerializer::Deserialize(Reader, Object) || !Object.IsValid())
 		{
-		case 'A': return ELoreWorkingCopyState::Added;
-		case 'M': return ELoreWorkingCopyState::Modified;
-		case 'D': return ELoreWorkingCopyState::Deleted;
-		case 'V': return ELoreWorkingCopyState::Moved;
-		default:  return ELoreWorkingCopyState::Modified;
+			return false;
 		}
+		if (!Object->TryGetStringField(LoreJson::TagName, OutTag))
+		{
+			return false;
+		}
+		const TSharedPtr<FJsonObject>* DataField = nullptr;
+		if (Object->TryGetObjectField(LoreJson::Data, DataField) && DataField != nullptr)
+		{
+			OutData = *DataField;
+		}
+		return true;
 	}
 
-	void ParseStatusResults(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates)
+	// Map `repositoryStatusFile` event to a working-copy state. "keep" means tracked, so dirtiness decides modified versus unchanged.
+	ELoreWorkingCopyState::Type StatusStateFromEvent(const FString& InAction, bool bStaged, bool bDirty, bool bConflict)
 	{
-		EStatusSection Section = EStatusSection::None;
+		if (bConflict)
+		{
+			return ELoreWorkingCopyState::Conflicted;
+		}
+		if (InAction == LoreJson::ActionValues::Add)
+		{
+			// A staged add is marked for add; an unstaged one is still untracked.
+			return bStaged ? ELoreWorkingCopyState::Added : ELoreWorkingCopyState::NotControlled;
+		}
+		if (InAction == LoreJson::ActionValues::Delete)
+		{
+			return ELoreWorkingCopyState::Deleted;
+		}
+		if (InAction == LoreJson::ActionValues::Move)
+		{
+			return ELoreWorkingCopyState::Moved;
+		}
+		if (InAction == LoreJson::ActionValues::Copy)
+		{
+			return ELoreWorkingCopyState::Copied;
+		}
+		return bDirty ? ELoreWorkingCopyState::Modified : ELoreWorkingCopyState::Unchanged;
+	}
+
+	// Skip build output and tool folders that should never be source controlled, so a repository missing a .loreignore does not flood the submit dialog.
+	bool IsTransientRepoPath(const FString& InPath)
+	{
+		static const TSet<FString> Transient = { TEXT("Binaries"), TEXT("Intermediate"), TEXT("Saved"), TEXT("DerivedDataCache"), TEXT(".git"), TEXT(".lore"), TEXT(".vs"), TEXT(".idea") };
+		TArray<FString> Segments;
+		InPath.ParseIntoArray(Segments, TEXT("/"), true);
+		for (const FString& Segment : Segments)
+		{
+			if (Transient.Contains(Segment))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void ParseStatusResults(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates, bool& bOutRemoteAhead)
+	{
+		bOutRemoteAhead = false;
 		for (const FString& Line : InResults)
 		{
-			if (Line.StartsWith(TEXT("Untracked files")))
-			{
-				Section = EStatusSection::Untracked;
-				continue;
-			}
-
-			if (Line.StartsWith(TEXT("Changes not staged")))
-			{
-				Section = EStatusSection::NotStaged;
-				continue;
-			}
-
-			if (Line.StartsWith(TEXT("Changes staged")))
-			{
-				Section = EStatusSection::Staged;
-				continue;
-			}
-
-			if (Section == EStatusSection::None || Line.IsEmpty() || Line.StartsWith(TEXT("Tracked changes")) || Line.StartsWith(TEXT("No tracked changes")))
+			FString Tag;
+			TSharedPtr<FJsonObject> Data;
+			if (!ParseJsonEvent(Line, Tag, Data) || !Data.IsValid())
 			{
 				continue;
 			}
 
-			// A per file line is "<LETTER> <path>"
-			if (Line.Len() >= 3 && Line[1] == TEXT(' '))
+			if (Tag == LoreJson::Tags::RepositoryStatusRevision)
 			{
-				const ELoreWorkingCopyState::Type State = ActionLetterToState(Line[0], Section);
-				FString Path = Line.RightChop(2).TrimStartAndEnd();
-				// A rename reads "<from> -> <to>", so key on the destination
-				int32 ArrowIndex = INDEX_NONE;
-				if (Path.FindLastChar(TEXT('>'), ArrowIndex) && ArrowIndex > 0 && Path[ArrowIndex - 1] == TEXT('-'))
-				{
-					Path = Path.RightChop(ArrowIndex + 1).TrimStartAndEnd();
-				}
-
-				Path.ReplaceInline(TEXT("\\"), TEXT("/"));
-				OutStates.Add(Path, State);
+				int32 RemoteAhead = 0;
+				Data->TryGetNumberField(LoreJson::IsRemoteAhead, RemoteAhead);
+				bOutRemoteAhead = RemoteAhead != 0;
+				continue;
 			}
+
+			if (Tag != LoreJson::Tags::RepositoryStatusFile)
+			{
+				continue;
+			}
+
+			FString Type;
+			Data->TryGetStringField(LoreJson::Type, Type);
+			if (Type == LoreJson::TypeDirectory)
+			{
+				continue;
+			}
+
+			FString Path;
+			if (!Data->TryGetStringField(LoreJson::Path, Path) || Path.IsEmpty())
+			{
+				continue;
+			}
+			Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+			if (IsTransientRepoPath(Path))
+			{
+				continue;
+			}
+
+			FString Action;
+			Data->TryGetStringField(LoreJson::Action, Action);
+			bool bStaged = false, bDirty = false, bConflict = false, bConflictUnresolved = false;
+			Data->TryGetBoolField(LoreJson::FlagStaged, bStaged);
+			Data->TryGetBoolField(LoreJson::FlagDirty, bDirty);
+			Data->TryGetBoolField(LoreJson::FlagConflict, bConflict);
+			Data->TryGetBoolField(LoreJson::FlagConflictUnresolved, bConflictUnresolved);
+
+			// A later event for the same path takes precedence, matching the duplication the scan emits.
+			OutStates.Add(Path, StatusStateFromEvent(Action, bStaged, bDirty, bConflict || bConflictUnresolved));
 		}
 	}
 
 	void ParseLockResults(const TArray<FString>& InResults, TMap<FString, FString>& OutLocks)
 	{
-		// Records read "<path> by <owner> on <date>". A path can contain " by ", so strip " on <date>" first, then split on the last " by ".
-		const FString ByToken = TEXT(" by ");
-		bool bInLockSection = false;
+		// `lockFileStatus` events carry the local cache before any remote-authentication error, so owners parse even offline.
 		for (const FString& Line : InResults)
 		{
-			if (Line.StartsWith(TEXT("Files locked")))
-			{
-				bInLockSection = true;
-				continue;
-			}
-
-			if (!bInLockSection || Line.IsEmpty())
+			FString Tag;
+			TSharedPtr<FJsonObject> Data;
+			if (!ParseJsonEvent(Line, Tag, Data) || !Data.IsValid())
 			{
 				continue;
 			}
-
-			FString Record = Line;
-			const int32 OnIndex = Record.Find(TEXT(" on "), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
-			if (OnIndex != INDEX_NONE)
-			{
-				Record = Record.Left(OnIndex);
-			}
-
-			const int32 ByIndex = Record.Find(ByToken, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-			if (ByIndex == INDEX_NONE)
+			if (Tag != LoreJson::Tags::LockFileStatus)
 			{
 				continue;
 			}
-
-			FString Path = Record.Left(ByIndex).TrimStartAndEnd();
-			const FString Owner = Record.RightChop(ByIndex + ByToken.Len()).TrimStartAndEnd();
+			FString Path;
+			if (!Data->TryGetStringField(LoreJson::Path, Path))
+			{
+				continue;
+			}
+			FString Owner;
+			Data->TryGetStringField(LoreJson::Owner, Owner);
 			Path.ReplaceInline(TEXT("\\"), TEXT("/"));
 			OutLocks.Add(Path, Owner);
+		}
+	}
+
+	// Read the remote reachability and authorization flags from the status revision header.
+	void ParseRemoteAuthResults(const TArray<FString>& InResults, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
+	{
+		bOutRemoteAvailable = false;
+		bOutRemoteAuthorized = false;
+		for (const FString& Line : InResults)
+		{
+			FString Tag;
+			TSharedPtr<FJsonObject> Data;
+			if (!ParseJsonEvent(Line, Tag, Data) || !Data.IsValid() || Tag != LoreJson::Tags::RepositoryStatusRevision)
+			{
+				continue;
+			}
+
+			int32 Available = 0, Authorized = 0;
+			Data->TryGetNumberField(LoreJson::RemoteAvailable, Available);
+			Data->TryGetNumberField(LoreJson::RemoteAuthorized, Authorized);
+			bOutRemoteAvailable = Available != 0;
+			bOutRemoteAuthorized = Authorized != 0;
+			return;
 		}
 	}
 }
@@ -203,14 +340,19 @@ namespace
 namespace LoreSourceControlUtils
 {
 
-void ParseStatusForTest(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates)
+void ParseStatusForTest(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates, bool& bOutRemoteAhead)
 {
-	ParseStatusResults(InResults, OutStates);
+	ParseStatusResults(InResults, OutStates, bOutRemoteAhead);
 }
 
 void ParseLocksForTest(const TArray<FString>& InResults, TMap<FString, FString>& OutLocks)
 {
 	ParseLockResults(InResults, OutLocks);
+}
+
+void ParseRemoteAuthForTest(const TArray<FString>& InResults, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
+{
+	ParseRemoteAuthResults(InResults, bOutRemoteAvailable, bOutRemoteAuthorized);
 }
 
 FString RelativeFilename(const FString& InFile, const FString& InRepositoryRoot)
@@ -267,7 +409,7 @@ bool IsBundledClientPresent()
 
 FString FindLoreBinaryPath()
 {
-	// A bundled copy wins over a system install.
+	// A bundled copy takes precedence over a system install.
 	const FString Bundled = GetBundledClientPath();
 	if (!Bundled.IsEmpty() && FPaths::FileExists(Bundled))
 	{
@@ -388,11 +530,11 @@ void GetRepositoryConfig(const FString& InRepositoryRoot, FString& OutRemoteUrl,
 			Value.TrimStartAndEndInline();
 			Value.RemoveFromStart(TEXT("\""));
 			Value.RemoveFromEnd(TEXT("\""));
-			if (Key == TEXT("remote_url"))
+			if (Key == LoreConfig::RemoteUrl)
 			{
 				OutRemoteUrl = Value;
 			}
-			else if (Key == TEXT("identity"))
+			else if (Key == LoreConfig::Identity)
 			{
 				OutIdentity = Value;
 			}
@@ -426,6 +568,18 @@ bool GetBranchName(const FString& InPathToLoreBinary, const FString& InRepositor
 	return false;
 }
 
+void LaunchLogin(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InRemoteUrl)
+{
+	// Login is interactive and opens a browser, so launch it detached and do not wait on it.
+	const FString Params = InRemoteUrl.IsEmpty() ? TEXT("auth login") : FString::Printf(TEXT("auth login %s"), *InRemoteUrl);
+	const TCHAR* WorkingDirectory = InRepositoryRoot.IsEmpty() ? nullptr : *InRepositoryRoot;
+	FProcHandle Handle = FPlatformProcess::CreateProc(*InPathToLoreBinary, *Params, true, false, false, nullptr, 0, WorkingDirectory, nullptr);
+	if (Handle.IsValid())
+	{
+		FPlatformProcess::CloseProc(Handle);
+	}
+}
+
 bool RunCommand(const FString& InCommand, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
 	FString Results, Errors;
@@ -441,6 +595,20 @@ bool RunCommand(const FString& InCommand, const FString& InPathToLoreBinary, con
 	}
 
 	return bOk;
+}
+
+void GetRemoteAuthState(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
+{
+	// Plain status, no --scan: a light read of the revision header flags, not a tree walk that persists dirty state.
+	bOutRemoteAvailable = false;
+	bOutRemoteAuthorized = false;
+	TArray<FString> Results, Errors;
+	if (!RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, TArray<FString>(), Results, Errors))
+	{
+		return;
+	}
+
+	ParseRemoteAuthResults(Results, bOutRemoteAvailable, bOutRemoteAuthorized);
 }
 
 bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InIdentity, bool bInUsingLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FLoreSourceControlState>& OutStates)
@@ -481,24 +649,15 @@ bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InReposit
 	{
 		TArray<FString> Parameters;
 		Parameters.Add(TEXT("--scan"));
+		Parameters.Add(TEXT("--json"));
 		TArray<FString> Results;
 		bOk = RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, Parameters, RelativeFiles, Results, OutErrorMessages);
-		ParseStatusResults(Results, Parsed);
-
-		// The status header is the only sync signal: behind remote means not at the latest revision.
-		for (const FString& Line : Results)
-		{
-			if (Line.Contains(TEXT("behind remote")))
-			{
-				bBehindRemote = true;
-				break;
-			}
-		}
+		ParseStatusResults(Results, Parsed, bBehindRemote);
 
 		if (bInUsingLocking)
 		{
 			TArray<FString> LockResults, LockErrors;
-			RunCommand(TEXT("lock status"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), RelativeFiles, LockResults, LockErrors);
+			RunCommand(TEXT("lock status"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, RelativeFiles, LockResults, LockErrors);
 			ParseLockResults(LockResults, Locks);
 		}
 	}
@@ -556,30 +715,62 @@ bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InReposit
 	return bOk;
 }
 
+bool CollectCheckInBlockers(const TArray<FLoreSourceControlState>& InStates, bool bAllowOverLock, TArray<FString>& OutMessages)
+{
+	// A behind-the-remote file is allowed (the commit is local; a rejected push is reported). A foreign lock blocks unless the caller forces over it. An unresolved conflict always blocks.
+	for (const FLoreSourceControlState& State : InStates)
+	{
+		if (!bAllowOverLock && State.LockState == ELoreLockState::LockedOther)
+		{
+			OutMessages.Add(FString::Printf(TEXT("Cannot submit %s: locked by %s."), *FPaths::GetCleanFilename(State.GetFilename()), *State.LockUser));
+		}
+		else if (State.IsConflicted())
+		{
+			OutMessages.Add(FString::Printf(TEXT("Cannot submit %s: unresolved conflict. Resolve, then submit."), *FPaths::GetCleanFilename(State.GetFilename())));
+		}
+	}
+
+	return OutMessages.Num() > 0;
+}
+
+// Get the user-facing action label shown in the file history column from a raw Lore action string.
+FString LoreActionToString(const FString& InAction)
+{
+	static const TMap<FString, FString> Labels = {
+		{ LoreJson::ActionValues::Add,    TEXT("Add") },
+		{ LoreJson::ActionValues::Keep,   TEXT("Keep (Edit)") }, // Lore keeps an edited-but-present file as "keep"
+		{ LoreJson::ActionValues::Delete, TEXT("Delete") },
+		{ LoreJson::ActionValues::Move,   TEXT("Move") },
+		{ LoreJson::ActionValues::Copy,   TEXT("Copy") },
+	};
+	const FString* Label = Labels.Find(InAction);
+	return Label ? *Label : InAction;
+}
+
 bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory)
 {
 	const FString RelativeFile = RelativeFilename(InFile, InRepositoryRoot);
 	TArray<FString> Results;
-	if (!RunCommand(TEXT("file history"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), { RelativeFile }, Results, OutErrorMessages))
+	if (!RunCommand(TEXT("file history"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, { RelativeFile }, Results, OutErrorMessages))
 	{
 		return false;
 	}
 
 	const FString Absolute = FPaths::ConvertRelativePathToFull(InFile);
 	TSharedPtr<FLoreSourceControlRevision, ESPMode::ThreadSafe> Current;
-	FString PendingAction;
 
 	for (const FString& Line : Results)
 	{
-		// "<LETTER> <path>" begins a revision block and carries its action.
-		if (Line.Len() >= 3 && Line[1] == TEXT(' ') && FChar::IsUpper(Line[0]) && !Line.Contains(TEXT(" : ")))
+		FString Tag;
+		TSharedPtr<FJsonObject> Data;
+		if (!ParseJsonEvent(Line, Tag, Data) || !Data.IsValid())
 		{
-			PendingAction = FString::Chr(Line[0]);
 			continue;
 		}
 
-		if (Line.StartsWith(TEXT("Revision")))
+		if (Tag == LoreJson::Tags::FileHistory)
 		{
+			// A new revision begins; the preceding one is complete.
 			if (Current.IsValid())
 			{
 				OutHistory.Add(Current.ToSharedRef());
@@ -589,36 +780,46 @@ bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositor
 			Current->Filename = Absolute;
 			Current->PathToLoreBinary = InPathToLoreBinary;
 			Current->PathToRepositoryRoot = InRepositoryRoot;
-			Current->Action = PendingAction;
-			FString Value;
-			if (Line.Split(TEXT(":"), nullptr, &Value))
-			{
-				Current->RevisionNumber = FCString::Atoi(*Value.TrimStartAndEnd());
-			}
+			FString Revision;
+			Data->TryGetStringField(LoreJson::Revision, Revision);
+			Current->CommitId = Revision;
+			Current->ShortCommitId = Revision.Left(8);
+			int32 RevisionNumber = 0;
+			Data->TryGetNumberField(LoreJson::RevisionNumber, RevisionNumber);
+			Current->RevisionNumber = RevisionNumber;
+			FString Action;
+			Data->TryGetStringField(LoreJson::Action, Action);
+			Current->Action = LoreActionToString(Action);
 			continue;
 		}
 
-		if (!Current.IsValid())
+		if (Tag != LoreJson::Tags::Metadata || !Current.IsValid())
 		{
 			continue;
 		}
-		FString Value;
-		if (Line.StartsWith(TEXT("Signature")) && Line.Split(TEXT(":"), nullptr, &Value))
+
+		// Each metadata value is itself a tagged object whose "data" carries the payload.
+		FString Key;
+		Data->TryGetStringField(LoreJson::Key, Key);
+		const TSharedPtr<FJsonObject>* ValueField = nullptr;
+		if (!Data->TryGetObjectField(LoreJson::Value, ValueField) || ValueField == nullptr)
 		{
-			Current->CommitId = Value.TrimStartAndEnd();
-			Current->ShortCommitId = Current->CommitId.Left(8);
+			continue;
 		}
-		else if (Line.StartsWith(TEXT("Date")) && Line.Split(TEXT(":"), nullptr, &Value))
+		if (Key == LoreJson::MetadataKeys::Timestamp)
 		{
-			ParseLoreDate(Value.TrimStartAndEnd(), Current->Date);
+			double Milliseconds = 0.0;
+			(*ValueField)->TryGetNumberField(LoreJson::Data, Milliseconds);
+			Current->Date = FDateTime::FromUnixTimestamp(static_cast<int64>(Milliseconds / 1000.0));
 		}
-		else if (Line.StartsWith(TEXT("Creator")) && Line.Split(TEXT(":"), nullptr, &Value))
+		else if (Key == LoreJson::MetadataKeys::Message)
 		{
-			Current->UserName = Value.TrimStartAndEnd();
+			(*ValueField)->TryGetStringField(LoreJson::Data, Current->Description);
 		}
-		else if (Line.StartsWith(TEXT(" ")) && !Line.Contains(TEXT(":")))
+		else if (Key == LoreJson::MetadataKeys::CommittedBy || (Key == LoreJson::MetadataKeys::CreatedBy && Current->UserName.IsEmpty()))
 		{
-			Current->Description = Line.TrimStartAndEnd();
+			// Prefer the committer; the creator arrives first and seeds the field.
+			(*ValueField)->TryGetStringField(LoreJson::Data, Current->UserName);
 		}
 	}
 

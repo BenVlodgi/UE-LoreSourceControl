@@ -7,6 +7,7 @@
 #include "Misc/Paths.h"
 #include "Misc/Guid.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "ISourceControlModule.h"
@@ -48,6 +49,8 @@ bool FLoreSourceControlStateTest::RunTest(const FString& Parameters)
 		State.LockState = ELoreLockState::Locked;
 		TestTrue(TEXT("Locked is checked out"), State.IsCheckedOut());
 		TestFalse(TEXT("Locked cannot check out again"), State.CanCheckout());
+		TestEqual(TEXT("Clean held lock reads as Checked out"), State.GetDisplayName().ToString(), FString(TEXT("Checked out")));
+		TestTrue(TEXT("Held-lock tooltip names you"), State.GetDisplayTooltip().ToString().Contains(TEXT("Checked out by you")));
 	}
 	{
 		FLoreSourceControlState State(TEXT("C:/Project/D.uasset"));
@@ -59,6 +62,19 @@ bool FLoreSourceControlStateTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("Other is checked out by other"), State.IsCheckedOutOther(&Who));
 		TestEqual(TEXT("Other owner reported"), Who, FString(TEXT("teammate@example.com")));
 		TestFalse(TEXT("Other is not mine"), State.IsCheckedOut());
+		TestTrue(TEXT("LockedOther tooltip names the owner"), State.GetDisplayTooltip().ToString().Contains(TEXT("teammate@example.com")));
+	}
+	{
+		// A local edit must not mask a foreign lock.
+		FLoreSourceControlState State(TEXT("C:/Project/G.uasset"));
+		State.bUsingLocking = true;
+		State.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		State.LockState = ELoreLockState::LockedOther;
+		State.LockUser = TEXT("teammate@example.com");
+		FString Who;
+		TestTrue(TEXT("Locally modified file still reads locked by other"), State.IsCheckedOutOther(&Who));
+		TestTrue(TEXT("Locally modified file is still modified"), State.IsModified());
+		TestFalse(TEXT("Cannot check in a file locked by another"), State.CanCheckIn());
 	}
 	{
 		FLoreSourceControlState State(TEXT("C:/Project/E.uasset"));
@@ -78,44 +94,131 @@ bool FLoreSourceControlStateTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlCheckInGuardTest, "LoreSourceControl.CheckInGuard", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSourceControlCheckInGuardTest::RunTest(const FString& Parameters)
+{
+	{
+		FLoreSourceControlState State(TEXT("C:/Project/Clean.uasset"));
+		State.bUsingLocking = true;
+		State.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		State.LockState = ELoreLockState::Locked;
+		TArray<FString> Messages;
+		TestFalse(TEXT("A clean, current, self-locked file does not block submit"), LoreSourceControlUtils::CollectCheckInBlockers({ State }, false, Messages));
+		TestEqual(TEXT("No messages for a clean file"), Messages.Num(), 0);
+	}
+	{
+		FLoreSourceControlState State(TEXT("C:/Project/Other.uasset"));
+		State.bUsingLocking = true;
+		State.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		State.LockState = ELoreLockState::LockedOther;
+		State.LockUser = TEXT("alice@example.com");
+		TArray<FString> Messages;
+		TestTrue(TEXT("A file locked by another blocks submit"), LoreSourceControlUtils::CollectCheckInBlockers({ State }, false, Messages));
+		TestTrue(TEXT("The block message names the locker"), Messages.Num() == 1 && Messages[0].Contains(TEXT("alice@example.com")));
+
+		// Forcing over the lock lets it through.
+		TArray<FString> Forced;
+		TestFalse(TEXT("Forcing over the lock does not block submit"), LoreSourceControlUtils::CollectCheckInBlockers({ State }, true, Forced));
+	}
+	{
+		FLoreSourceControlState State(TEXT("C:/Project/Conflicted.uasset"));
+		State.WorkingCopyState = ELoreWorkingCopyState::Conflicted;
+		TArray<FString> Messages;
+		TestTrue(TEXT("A conflicted file blocks submit"), LoreSourceControlUtils::CollectCheckInBlockers({ State }, false, Messages));
+
+		// A conflict still blocks even when forcing over a lock.
+		TArray<FString> Forced;
+		TestTrue(TEXT("Forcing over a lock does not override a conflict"), LoreSourceControlUtils::CollectCheckInBlockers({ State }, true, Forced));
+	}
+	{
+		// Behind the server no longer blocks; the commit is local and the row warns instead.
+		FLoreSourceControlState Stale(TEXT("C:/Project/Stale.uasset"));
+		Stale.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		Stale.bNewerVersionOnServer = true;
+		TArray<FString> Messages;
+		TestFalse(TEXT("A file behind the server does not block submit"), LoreSourceControlUtils::CollectCheckInBlockers({ Stale }, false, Messages));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlStatusParseTest, "LoreSourceControl.StatusParse", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FLoreSourceControlStatusParseTest::RunTest(const FString& Parameters)
 {
 	const TArray<FString> Lines = {
-		TEXT("Repository 019ed92f26b87992ad207981d8273aaa"),
-		TEXT("On branch main revision 1 -> abc"),
-		TEXT("Remote revision 1 -> abc"),
-		TEXT("Local branch in sync with remote"),
-		TEXT("Changes staged for commit:"),
-		TEXT("A asset.bin"),
-		TEXT("A hello.txt"),
-		TEXT("V old.uasset -> new.uasset"),
-		TEXT("Changes not staged for commit:"),
-		TEXT("M edited.txt"),
-		TEXT("D gone.bin"),
-		TEXT("Tracked changes: 2 added, 1 moved, 1 modified, 1 deleted"),
+		TEXT("{\"tagName\":\"repositoryStatusRevision\",\"data\":{\"branchName\":\"main\",\"isRemoteAhead\":1,\"isLocalAhead\":0,\"remoteAuthorized\":1}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"Config\",\"type\":\"directory\",\"action\":\"add\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"staged_add.uasset\",\"type\":\"file\",\"action\":\"add\",\"flagStaged\":true,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"untracked.txt\",\"type\":\"file\",\"action\":\"add\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"edited.uasset\",\"type\":\"file\",\"action\":\"keep\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"clean.uasset\",\"type\":\"file\",\"action\":\"keep\",\"flagStaged\":false,\"flagDirty\":false}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"gone.bin\",\"type\":\"file\",\"action\":\"delete\",\"flagStaged\":true,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"new.uasset\",\"type\":\"file\",\"action\":\"move\",\"fromPath\":\"old.uasset\",\"flagStaged\":true,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"dup.uasset\",\"type\":\"file\",\"action\":\"copy\",\"flagStaged\":true,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"merge.uasset\",\"type\":\"file\",\"action\":\"keep\",\"flagConflict\":true,\"flagConflictUnresolved\":true,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"Saved/Autosaves/x.uasset\",\"type\":\"file\",\"action\":\"add\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\"Plugins/Foo/Intermediate/y.bin\",\"type\":\"file\",\"action\":\"add\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"repositoryStatusFile\",\"data\":{\"path\":\".gitignore\",\"type\":\"file\",\"action\":\"keep\",\"flagStaged\":false,\"flagDirty\":true}}"),
+		TEXT("{\"tagName\":\"complete\",\"data\":{\"status\":0}}"),
 	};
 	TMap<FString, ELoreWorkingCopyState::Type> Parsed;
-	LoreSourceControlUtils::ParseStatusForTest(Lines, Parsed);
+	bool bRemoteAhead = false;
+	LoreSourceControlUtils::ParseStatusForTest(Lines, Parsed, bRemoteAhead);
 
-	TestEqual(TEXT("Five files parsed"), Parsed.Num(), 5);
-	TestTrue(TEXT("asset.bin added"), Parsed.Contains(TEXT("asset.bin")) && Parsed[TEXT("asset.bin")] == ELoreWorkingCopyState::Added);
-	TestTrue(TEXT("hello.txt added"), Parsed.Contains(TEXT("hello.txt")) && Parsed[TEXT("hello.txt")] == ELoreWorkingCopyState::Added);
-	TestTrue(TEXT("edited.txt modified"), Parsed.Contains(TEXT("edited.txt")) && Parsed[TEXT("edited.txt")] == ELoreWorkingCopyState::Modified);
-	TestTrue(TEXT("gone.bin deleted"), Parsed.Contains(TEXT("gone.bin")) && Parsed[TEXT("gone.bin")] == ELoreWorkingCopyState::Deleted);
-	// A move reads "V <from> -> <to>", so key it on the destination
-	TestTrue(TEXT("new.uasset moved"), Parsed.Contains(TEXT("new.uasset")) && Parsed[TEXT("new.uasset")] == ELoreWorkingCopyState::Moved);
+	TestTrue(TEXT("Remote-ahead read from the revision event"), bRemoteAhead);
+	TestEqual(TEXT("Directory and transient entries skipped, nine files parsed"), Parsed.Num(), 9);
+	TestFalse(TEXT("A Saved path is filtered"), Parsed.Contains(TEXT("Saved/Autosaves/x.uasset")));
+	TestFalse(TEXT("A nested Intermediate path is filtered"), Parsed.Contains(TEXT("Plugins/Foo/Intermediate/y.bin")));
+	TestTrue(TEXT("A tracked .gitignore is kept (not confused with the .git folder)"), Parsed.Contains(TEXT(".gitignore")) && Parsed[TEXT(".gitignore")] == ELoreWorkingCopyState::Modified);
+	TestTrue(TEXT("staged add is Added"), Parsed.Contains(TEXT("staged_add.uasset")) && Parsed[TEXT("staged_add.uasset")] == ELoreWorkingCopyState::Added);
+	TestTrue(TEXT("unstaged add is NotControlled"), Parsed.Contains(TEXT("untracked.txt")) && Parsed[TEXT("untracked.txt")] == ELoreWorkingCopyState::NotControlled);
+	TestTrue(TEXT("keep with dirty is Modified"), Parsed.Contains(TEXT("edited.uasset")) && Parsed[TEXT("edited.uasset")] == ELoreWorkingCopyState::Modified);
+	TestTrue(TEXT("keep without dirty is Unchanged"), Parsed.Contains(TEXT("clean.uasset")) && Parsed[TEXT("clean.uasset")] == ELoreWorkingCopyState::Unchanged);
+	TestTrue(TEXT("delete is Deleted"), Parsed.Contains(TEXT("gone.bin")) && Parsed[TEXT("gone.bin")] == ELoreWorkingCopyState::Deleted);
+	// A move event keys on the destination path
+	TestTrue(TEXT("move is Moved"), Parsed.Contains(TEXT("new.uasset")) && Parsed[TEXT("new.uasset")] == ELoreWorkingCopyState::Moved);
+	TestTrue(TEXT("copy is Copied"), Parsed.Contains(TEXT("dup.uasset")) && Parsed[TEXT("dup.uasset")] == ELoreWorkingCopyState::Copied);
+	TestTrue(TEXT("conflict flags make Conflicted"), Parsed.Contains(TEXT("merge.uasset")) && Parsed[TEXT("merge.uasset")] == ELoreWorkingCopyState::Conflicted);
 
-	const TArray<FString> Untracked = {
-		TEXT("Untracked files:"),
-		TEXT("A new.txt"),
-		TEXT("Tracked changes: 1 added"),
-	};
-	TMap<FString, ELoreWorkingCopyState::Type> ParsedUntracked;
-	LoreSourceControlUtils::ParseStatusForTest(Untracked, ParsedUntracked);
-	TestTrue(TEXT("new.txt is not controlled"), ParsedUntracked.Contains(TEXT("new.txt")) && ParsedUntracked[TEXT("new.txt")] == ELoreWorkingCopyState::NotControlled);
+	return true;
+}
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlAuthParseTest, "LoreSourceControl.AuthParse", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSourceControlAuthParseTest::RunTest(const FString& Parameters)
+{
+	{
+		// An unauthenticated server reports the remote available and the client authorized, so the row reads not required.
+		const TArray<FString> Lines = {
+			TEXT("{\"tagName\":\"repositoryStatusRevision\",\"data\":{\"branchName\":\"main\",\"remoteAvailable\":1,\"remoteAuthorized\":1}}"),
+			TEXT("{\"tagName\":\"complete\",\"data\":{\"status\":0}}"),
+		};
+		bool bAvailable = false, bAuthorized = false;
+		LoreSourceControlUtils::ParseRemoteAuthForTest(Lines, bAvailable, bAuthorized);
+		TestTrue(TEXT("Remote reads available"), bAvailable);
+		TestTrue(TEXT("Client reads authorized"), bAuthorized);
+	}
+	{
+		// A server that requires a login the client lacks reads available but not authorized, so the sign-in button shows.
+		const TArray<FString> Lines = {
+			TEXT("{\"tagName\":\"repositoryStatusRevision\",\"data\":{\"branchName\":\"main\",\"remoteAvailable\":1,\"remoteAuthorized\":0}}"),
+		};
+		bool bAvailable = false, bAuthorized = true;
+		LoreSourceControlUtils::ParseRemoteAuthForTest(Lines, bAvailable, bAuthorized);
+		TestTrue(TEXT("Remote reads available"), bAvailable);
+		TestFalse(TEXT("Client reads not authorized"), bAuthorized);
+	}
+	{
+		// An unreachable remote sets neither flag, so the row reads not reachable.
+		const TArray<FString> Lines = {
+			TEXT("{\"tagName\":\"repositoryStatusRevision\",\"data\":{\"branchName\":\"main\",\"remoteAvailable\":0,\"remoteAuthorized\":0}}"),
+		};
+		bool bAvailable = true, bAuthorized = true;
+		LoreSourceControlUtils::ParseRemoteAuthForTest(Lines, bAvailable, bAuthorized);
+		TestFalse(TEXT("Remote reads not reachable"), bAvailable);
+		TestFalse(TEXT("Not authorized when unreachable"), bAuthorized);
+	}
 	return true;
 }
 
@@ -124,23 +227,26 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlLockParseTest, "LoreSourceCon
 bool FLoreSourceControlLockParseTest::RunTest(const FString& Parameters)
 {
 	const TArray<FString> Lines = {
-		TEXT("Files locked for edit:"),
-		TEXT("asset.bin by alice@example.com on Thu, 18 Jun 2026 07:32:07 +0000"),
-		TEXT("Content/Stand by Me.uasset by bob@example.com on Thu, 18 Jun 2026 07:32:07 +0000"),
+		TEXT("{\"tagName\":\"lockFileStatusBegin\",\"data\":{\"count\":2}}"),
+		TEXT("{\"tagName\":\"lockFileStatus\",\"data\":{\"path\":\"asset.bin\",\"owner\":\"alice@example.com\",\"lockedAt\":1781854778871}}"),
+		TEXT("{\"tagName\":\"lockFileStatus\",\"data\":{\"path\":\"Content/Stand by Me.uasset\",\"owner\":\"bob@example.com\",\"lockedAt\":1781854778872}}"),
+		TEXT("{\"tagName\":\"complete\",\"data\":{\"status\":0}}"),
+		TEXT("{\"tagName\":\"error\",\"data\":{\"errorType\":4294967295,\"errorInner\":\"No auth endpoint available\"}}"),
+		TEXT("{\"tagName\":\"complete\",\"data\":{\"status\":1}}"),
 	};
 	TMap<FString, FString> Locks;
 	LoreSourceControlUtils::ParseLocksForTest(Lines, Locks);
 
-	TestEqual(TEXT("Two locks parsed"), Locks.Num(), 2);
+	TestEqual(TEXT("Two locks parsed, the trailing auth error ignored"), Locks.Num(), 2);
 	TestTrue(TEXT("asset.bin owned by alice"), Locks.Contains(TEXT("asset.bin")) && Locks[TEXT("asset.bin")] == TEXT("alice@example.com"));
-	// A path with " by " in it must key on the whole path, not a truncation
-	TestTrue(TEXT("path containing ' by ' parsed whole"), Locks.Contains(TEXT("Content/Stand by Me.uasset")) && Locks[TEXT("Content/Stand by Me.uasset")] == TEXT("bob@example.com"));
+	// A path with " by " in it carries no ambiguity in JSON
+	TestTrue(TEXT("path with spaces parsed whole"), Locks.Contains(TEXT("Content/Stand by Me.uasset")) && Locks[TEXT("Content/Stand by Me.uasset")] == TEXT("bob@example.com"));
 
-	// Lines outside the locked-files section are never records
-	const TArray<FString> NoHeader = { TEXT("some banner by the way on startup") };
+	// Non-event lines are never records
+	const TArray<FString> Noise = { TEXT("some banner on startup"), TEXT("") };
 	TMap<FString, FString> NoLocks;
-	LoreSourceControlUtils::ParseLocksForTest(NoHeader, NoLocks);
-	TestEqual(TEXT("No header means no locks"), NoLocks.Num(), 0);
+	LoreSourceControlUtils::ParseLocksForTest(Noise, NoLocks);
+	TestEqual(TEXT("Noise yields no locks"), NoLocks.Num(), 0);
 
 	return true;
 }
@@ -369,6 +475,7 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	{
 		TestFalse(TEXT("Revision carries a commit id"), History[0]->GetRevision().IsEmpty());
 		TestEqual(TEXT("Revision description is the commit message"), History[0]->GetDescription(), FString(TEXT("integration commit")));
+		TestEqual(TEXT("Creation revision action reads as Add"), History[0]->GetAction(), FString(TEXT("Add")));
 		TestTrue(TEXT("Revision date parsed (year is current era)"), History[0]->GetDate().GetYear() > 2000);
 
 		// Diff extracts a revision through this path; confirm it writes content.
@@ -381,6 +488,18 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 		FString DiffTempRepeat;
 		TestTrue(TEXT("Repeat extraction reuses the existing temp file"), History[0]->Get(DiffTempRepeat));
 		TestEqual(TEXT("Repeat extraction yields the same path"), DiffTempRepeat, DiffTemp);
+	}
+
+	// A second commit makes the latest revision an edit, which the JSON history reports as the "keep" action; confirm it reads as Keep (Edit).
+	FFileHelper::SaveStringToFile(TEXT("Hello Lore, second revision"), *File);
+	RunCommand(TEXT("stage"), Binary, Root, TArray<FString>(), { TEXT("hello.txt") }, Results, Errors);
+	RunCommand(TEXT("commit"), Binary, Root, { TEXT("\"edit commit\"") }, TArray<FString>(), Results, Errors);
+	TLoreSourceControlHistory History2;
+	RunGetHistory(Binary, Root, File, Errors, History2);
+	TestTrue(TEXT("History has two revisions after a second commit"), History2.Num() >= 2);
+	if (History2.Num() >= 2)
+	{
+		TestEqual(TEXT("Latest revision action reads as Keep (Edit)"), History2[0]->GetAction(), FString(TEXT("Keep (Edit)")));
 	}
 
 	RunCommand(TEXT("lock acquire"), Binary, Root, TArray<FString>(), { TEXT("hello.txt") }, Results, Errors);
@@ -501,7 +620,7 @@ bool FLoreSourceControlProviderTest::RunTest(const FString& Parameters)
 	const FSourceControlStatePtr CheckedOutState = Provider.GetState(TempFile, EStateCacheUsage::Use);
 	TestTrue(TEXT("Checked-out file reports IsCheckedOut"), CheckedOutState.IsValid() && CheckedOutState->IsCheckedOut());
 
-	// Submit with no change succeeds gracefully.
+	// Empty submit with no changes should succeed.
 	TSharedRef<FCheckIn, ESPMode::ThreadSafe> EmptyCheckIn = ISourceControlOperation::Create<FCheckIn>();
 	EmptyCheckIn->SetDescription(FText::FromString(TEXT("no change submit")));
 	const ECommandResult::Type EmptyResult = Provider.Execute(EmptyCheckIn, Targets, EConcurrency::Synchronous);
@@ -553,6 +672,69 @@ bool FLoreSourceControlProviderTest::RunTest(const FString& Parameters)
 	const FSourceControlStatePtr KeptState = Provider.GetState(TempFile, EStateCacheUsage::Use);
 	TestTrue(TEXT("File stays checked out after a keep-checked-out submit"), KeptState.IsValid() && KeptState->IsCheckedOut());
 #endif
+
+	// A committed binary asset stays read-only until this user checks it out.
+	const FString BinaryFile = FPaths::ConvertRelativePathToFull(Root / TEXT("readonly_probe.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("binary probe"), *BinaryFile);
+	const TArray<FString> BinaryTargets = { BinaryFile };
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), BinaryTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> BinaryCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	BinaryCheckIn->SetDescription(FText::FromString(TEXT("add binary probe")));
+	Provider.Execute(BinaryCheckIn, BinaryTargets, EConcurrency::Synchronous);
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	Provider.Execute(ISourceControlOperation::Create<FUpdateStatus>(), BinaryTargets, EConcurrency::Synchronous);
+	TestTrue(TEXT("Committed binary asset is read-only until checked out"), PlatformFile.IsReadOnly(*BinaryFile));
+	Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), BinaryTargets, EConcurrency::Synchronous);
+	TestFalse(TEXT("Checked-out binary asset is writable"), PlatformFile.IsReadOnly(*BinaryFile));
+	Provider.Execute(ISourceControlOperation::Create<FRevert>(), BinaryTargets, EConcurrency::Synchronous);
+	TestTrue(TEXT("Reverted binary asset is read-only again"), PlatformFile.IsReadOnly(*BinaryFile));
+
+	// Delete marks the file deleted.
+	const FString DeleteFile = FPaths::ConvertRelativePathToFull(Root / TEXT("delete_probe.txt"));
+	FFileHelper::SaveStringToFile(TEXT("delete probe"), *DeleteFile);
+	const TArray<FString> DeleteTargets = { DeleteFile };
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), DeleteTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> DeleteCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	DeleteCheckIn->SetDescription(FText::FromString(TEXT("add delete probe")));
+	Provider.Execute(DeleteCheckIn, DeleteTargets, EConcurrency::Synchronous);
+	const ECommandResult::Type DeleteResult = Provider.Execute(ISourceControlOperation::Create<FDelete>(), DeleteTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Delete through the provider succeeds"), (int32)DeleteResult, (int32)ECommandResult::Succeeded);
+	const FSourceControlStatePtr DeletedState = Provider.GetState(DeleteFile, EStateCacheUsage::Use);
+	TestTrue(TEXT("Deleted file reports IsDeleted"), DeletedState.IsValid() && DeletedState->IsDeleted());
+
+	// Reverting a newly added file returns it to not-controlled.
+	const FString AddRevertFile = FPaths::ConvertRelativePathToFull(Root / TEXT("addrevert_probe.txt"));
+	FFileHelper::SaveStringToFile(TEXT("add revert probe"), *AddRevertFile);
+	const TArray<FString> AddRevertTargets = { AddRevertFile };
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), AddRevertTargets, EConcurrency::Synchronous);
+	const FSourceControlStatePtr StagedProbe = Provider.GetState(AddRevertFile, EStateCacheUsage::Use);
+	TestTrue(TEXT("Staged probe reports IsAdded"), StagedProbe.IsValid() && StagedProbe->IsAdded());
+	Provider.Execute(ISourceControlOperation::Create<FRevert>(), AddRevertTargets, EConcurrency::Synchronous);
+	const FSourceControlStatePtr UnaddedProbe = Provider.GetState(AddRevertFile, EStateCacheUsage::Use);
+	TestFalse(TEXT("Reverted added file is no longer added"), UnaddedProbe.IsValid() && UnaddedProbe->IsAdded());
+
+	// A single operation marks several files for add at once, exercising the batched file list.
+	const FString BatchA = FPaths::ConvertRelativePathToFull(Root / TEXT("batch_a.txt"));
+	const FString BatchB = FPaths::ConvertRelativePathToFull(Root / TEXT("batch_b.txt"));
+	FFileHelper::SaveStringToFile(TEXT("batch a"), *BatchA);
+	FFileHelper::SaveStringToFile(TEXT("batch b"), *BatchB);
+	const TArray<FString> BatchTargets = { BatchA, BatchB };
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), BatchTargets, EConcurrency::Synchronous);
+	const FSourceControlStatePtr BatchAState = Provider.GetState(BatchA, EStateCacheUsage::Use);
+	const FSourceControlStatePtr BatchBState = Provider.GetState(BatchB, EStateCacheUsage::Use);
+	TestTrue(TEXT("First batched file is added"), BatchAState.IsValid() && BatchAState->IsAdded());
+	TestTrue(TEXT("Second batched file is added"), BatchBState.IsValid() && BatchBState->IsAdded());
+
+	// Move or rename: FCopy stages the destination so the moved asset is tracked (the editor copies content to the new path and redirects the old).
+	const FString MoveDest = FPaths::ConvertRelativePathToFull(Root / TEXT("moved.txt"));
+	FFileHelper::SaveStringToFile(TEXT("moved content"), *MoveDest);
+	TSharedRef<FCopy, ESPMode::ThreadSafe> CopyOp = ISourceControlOperation::Create<FCopy>();
+	CopyOp->SetDestination(MoveDest);
+	const ECommandResult::Type CopyResult = Provider.Execute(CopyOp, TArray<FString>{ MoveDest }, EConcurrency::Synchronous);
+	TestEqual(TEXT("Copy through the provider succeeds"), (int32)CopyResult, (int32)ECommandResult::Succeeded);
+	const FSourceControlStatePtr MovedState = Provider.GetState(MoveDest, EStateCacheUsage::Use);
+	TestTrue(TEXT("Moved destination is staged for add"), MovedState.IsValid() && MovedState->IsAdded());
 
 	return true;
 }

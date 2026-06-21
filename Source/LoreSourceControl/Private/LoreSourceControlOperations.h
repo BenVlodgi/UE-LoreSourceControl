@@ -5,6 +5,15 @@
 #include "CoreMinimal.h"
 #include "ILoreSourceControlWorker.h"
 #include "LoreSourceControlState.h"
+#include "SourceControlOperations.h"
+
+/** Check in even when another user holds the Lore lock. Carries a description like a normal check in. */
+class FLoreCheckInOverLock : public FCheckIn
+{
+public:
+	virtual FName GetName() const override { return "CheckInOverLock"; }
+	virtual FText GetInProgressString() const override { return NSLOCTEXT("LoreSourceControl", "Lore_CheckInOverLock", "Checking in over an existing lock..."); }
+};
 
 /** Confirm the Lore client and find the working tree, then refresh the provider's repository information. */
 class FLoreConnectWorker : public ILoreSourceControlWorker
@@ -27,6 +36,8 @@ public:
 	FString BranchName;
 	FString RepositoryId;
 	FString LoreVersion;
+	bool bRemoteAvailable = false;
+	bool bRemoteAuthorized = false;
 };
 
 /** Get the source control status of files, and their history when asked. */
@@ -112,6 +123,19 @@ public:
 
 /** Commit the submitted files and push the revision. */
 class FLoreCheckInWorker : public ILoreSourceControlWorker
+{
+public:
+	//~ Begin ILoreSourceControlWorker interface
+	virtual FName GetName() const override;
+	virtual bool Execute(FLoreSourceControlCommand& InCommand) override;
+	virtual bool UpdateStates() const override;
+	//~ End ILoreSourceControlWorker interface
+
+	TArray<FLoreSourceControlState> States;
+};
+
+/** Check in the submitted files over a foreign lock. */
+class FLoreCheckInOverLockWorker : public ILoreSourceControlWorker
 {
 public:
 	//~ Begin ILoreSourceControlWorker interface

@@ -25,6 +25,8 @@
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SExpandableArea.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #endif
 
 #define LOCTEXT_NAMESPACE "LoreSourceControl.Provider"
@@ -427,6 +429,51 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 			})
 		]
 	]
+	// Offer sign-in only when the server reports it needs a login the client lacks.
+	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 4.0f, 2.0f, 2.0f)
+	[
+		SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+		[
+			SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("AuthLabel", "Authentication"))
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+		[
+			SNew(STextBlock).Text_Lambda([]()
+			{
+				const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+				if (!Provider.IsRemoteAvailable())
+				{
+					return LOCTEXT("AuthUnreachable", "Server not reachable");
+				}
+				return Provider.IsRemoteAuthorized()
+					? LOCTEXT("AuthNotRequired", "Not required")
+					: LOCTEXT("AuthRequired", "Required, not signed in");
+			})
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+		[
+			SNew(SButton)
+			.Visibility_Lambda([]()
+			{
+				const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+				return (Provider.IsRemoteAvailable() && !Provider.IsRemoteAuthorized()) ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+			.ToolTipText(LOCTEXT("LoginTip", "Sign in to the Lore server. Opens a browser."))
+			.OnClicked_Lambda([]()
+			{
+				const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+				FNotificationInfo Info(LOCTEXT("LoginStarting", "Opening a browser to sign in to Lore..."));
+				Info.ExpireDuration = 4.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				LoreSourceControlUtils::LaunchLogin(Provider.GetLoreBinaryPath(), Provider.GetPathToRepositoryRoot(), Provider.GetRemoteUrl());
+				return FReply::Handled();
+			})
+			[
+				SNew(STextBlock).Text(LOCTEXT("Login", "Log in"))
+			]
+		]
+	]
 	// Settings
 	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 8.0f, 2.0f, 2.0f)
 	[
@@ -535,6 +582,12 @@ void FLoreSourceControlProvider::SetRepositoryInfo(bool bInAvailable, bool bInRe
 	LoreVersion = InLoreVersion;
 }
 
+void FLoreSourceControlProvider::SetRemoteAuthState(bool bInRemoteAvailable, bool bInRemoteAuthorized)
+{
+	bRemoteAvailable = bInRemoteAvailable;
+	bRemoteAuthorized = bInRemoteAuthorized;
+}
+
 TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> FLoreSourceControlProvider::GetStateInternal(const FString& InFilename)
 {
 	if (TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>* Found = StateCache.Find(InFilename))
@@ -559,7 +612,8 @@ TSharedPtr<ILoreSourceControlWorker, ESPMode::ThreadSafe> FLoreSourceControlProv
 
 ECommandResult::Type FLoreSourceControlProvider::ExecuteSynchronousCommand(FLoreSourceControlCommand& InCommand, const FText& Task)
 {
-	FScopedSourceControlProgress Progress(Task);
+	// No progress dialog for a synchronous command; the editor that requested it already shows one, so a second here is the double popup. Perforce suppresses it the same way.
+	FScopedSourceControlProgress Progress(FText::GetEmpty());
 	InCommand.DoWork();
 	const bool bStatesChanged = InCommand.Worker->UpdateStates();
 	const ECommandResult::Type Result = InCommand.ReturnResults();

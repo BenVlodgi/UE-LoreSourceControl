@@ -9,11 +9,14 @@ class FLoreSourceControlRevision;
 
 namespace LoreSourceControlUtils
 {
-	/** Parse `lore status` output lines into a relative-path to working-copy-state map. Exposed for tests. */
-	void ParseStatusForTest(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates);
+	/** Parse `lore status --json` event lines into a relative-path to working-copy-state map and the branch behind-remote flag. Exposed for tests. */
+	void ParseStatusForTest(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates, bool& bOutRemoteAhead);
 
-	/** Parse `lore lock status` output into a relative-path to owner map. Exposed for tests. */
+	/** Parse `lore lock status --json` event lines into a relative-path to owner map. Exposed for tests. */
 	void ParseLocksForTest(const TArray<FString>& InResults, TMap<FString, FString>& OutLocks);
+
+	/** Parse the remote reachability and authorization flags from the status revision header. Exposed for tests. */
+	void ParseRemoteAuthForTest(const TArray<FString>& InResults, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized);
 
 	/** Find the Lore client on PATH or common install locations. Empty if not found. */
 	FString FindLoreBinaryPath();
@@ -45,6 +48,12 @@ namespace LoreSourceControlUtils
 	/** Read the current branch name. */
 	bool GetBranchName(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, FString& OutBranchName);
 
+	/** Probe the remote from the status revision header: whether it is reachable and whether the client is authorized. */
+	void GetRemoteAuthState(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized);
+
+	/** Launch `lore auth login` in the background; it opens a browser to authenticate the client. */
+	void LaunchLogin(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InRemoteUrl);
+
 	/** The single process chokepoint: build the argument list, run Lore, capture output. */
 	bool RunCommand(const FString& InCommand, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
@@ -53,6 +62,9 @@ namespace LoreSourceControlUtils
 
 	/** Read a file's revision history into shared revision records. */
 	bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory);
+
+	/** Collect reasons a submit must be refused before it mutates the staged set. With bAllowOverLock a foreign lock no longer blocks; an unresolved conflict always does. Returns true when any file blocks the submit. */
+	bool CollectCheckInBlockers(const TArray<FLoreSourceControlState>& InStates, bool bAllowOverLock, TArray<FString>& OutMessages);
 
 	/** Push parsed states into the provider's cache. Returns whether anything changed. Game thread only. */
 	bool UpdateCachedStates(const TArray<FLoreSourceControlState>& InStates);

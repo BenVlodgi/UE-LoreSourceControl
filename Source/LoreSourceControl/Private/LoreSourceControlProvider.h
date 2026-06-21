@@ -144,8 +144,23 @@ public:
 		return bLoreAvailable;
 	}
 
-	/** Set by the connect worker on the game thread to refresh the discovered repository information. */
+	/** Is the remote reachable, from the last connect probe */
+	inline bool IsRemoteAvailable() const
+	{
+		return bRemoteAvailable;
+	}
+
+	/** Is the client authorized on the remote; false means the server requires a sign-in the client lacks */
+	inline bool IsRemoteAuthorized() const
+	{
+		return bRemoteAuthorized;
+	}
+
+	/** Store the discovered repository information in the provider's connection state. Game thread only. */
 	void SetRepositoryInfo(bool bInAvailable, bool bInRepositoryFound, const FString& InRepositoryRoot, const FString& InRemoteUrl, const FString& InIdentity, const FString& InBranchName, const FString& InRepositoryId, const FString& InLoreVersion);
+
+	/** Store whether the remote is reachable and the client is authorized. Game thread only. */
+	void SetRemoteAuthState(bool bInRemoteAvailable, bool bInRemoteAuthorized);
 
 	/** Helper function used to update the state cache */
 	TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& InFilename);
@@ -199,6 +214,12 @@ private:
 
 	/** Version string of the Lore client */
 	FString LoreVersion;
+
+	/** Remote reachable, from the last connect probe */
+	bool bRemoteAvailable = true;
+
+	/** Client authorized on the remote; false means the server requires a sign-in the client lacks */
+	bool bRemoteAuthorized = true;
 
 	/** State cache, keyed by absolute filename */
 	TMap<FString, TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>> StateCache;
