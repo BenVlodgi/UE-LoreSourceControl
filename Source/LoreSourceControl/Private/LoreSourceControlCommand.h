@@ -11,6 +11,7 @@
 #include "ISourceControlChangelist.h"
 #endif
 #include "ILoreSourceControlWorker.h"
+#include "LoreSourceControlSettings.h"
 
 /** Used to run Lore commands on a worker thread. */
 class FLoreSourceControlCommand : public IQueuedWork
@@ -48,6 +49,9 @@ public:
 
 	/** Check in pushes the revision to the server */
 	bool bPushAfterCommit = true;
+
+	/** Which backend this command runs through */
+	ELoreBackendMode BackendMode = ELoreBackendMode::Native;
 
 	FSourceControlOperationRef Operation;
 	FLoreSourceControlWorkerRef Worker;

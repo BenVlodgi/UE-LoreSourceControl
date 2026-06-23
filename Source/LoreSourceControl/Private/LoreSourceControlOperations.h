@@ -7,7 +7,7 @@
 #include "LoreSourceControlState.h"
 #include "SourceControlOperations.h"
 
-/** Check in even when another user holds the Lore lock. Carries a description like a normal check in. */
+/** Check in even when another user holds the Lore lock. */
 class FLoreCheckInOverLock : public FCheckIn
 {
 public:
@@ -15,7 +15,6 @@ public:
 	virtual FText GetInProgressString() const override { return NSLOCTEXT("LoreSourceControl", "Lore_CheckInOverLock", "Checking in over an existing lock..."); }
 };
 
-/** Confirm the Lore client and find the working tree, then refresh the provider's repository information. */
 class FLoreConnectWorker : public ILoreSourceControlWorker
 {
 public:
@@ -40,7 +39,6 @@ public:
 	bool bRemoteAuthorized = false;
 };
 
-/** Get the source control status of files, and their history when asked. */
 class FLoreUpdateStatusWorker : public ILoreSourceControlWorker
 {
 public:
@@ -69,7 +67,6 @@ public:
 	TArray<FLoreSourceControlState> States;
 };
 
-/** Stage a new file for the next commit. */
 class FLoreMarkForAddWorker : public ILoreSourceControlWorker
 {
 public:
@@ -108,7 +105,6 @@ public:
 	TArray<FLoreSourceControlState> States;
 };
 
-/** Pull the latest revision from the server. */
 class FLoreSyncWorker : public ILoreSourceControlWorker
 {
 public:
@@ -147,7 +143,6 @@ public:
 	TArray<FLoreSourceControlState> States;
 };
 
-/** Stage a copied or moved asset. */
 class FLoreCopyWorker : public ILoreSourceControlWorker
 {
 public:
@@ -160,7 +155,6 @@ public:
 	TArray<FLoreSourceControlState> States;
 };
 
-/** Mark a conflicted file resolved. */
 class FLoreResolveWorker : public ILoreSourceControlWorker
 {
 public:

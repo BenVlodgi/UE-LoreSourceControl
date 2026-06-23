@@ -106,7 +106,7 @@ void FLoreSourceControlMenu::CheckInOverLockClicked(TArray<FAssetData> SelectedA
 	}
 	const TArray<FString> Filenames = SourceControlHelpers::PackageFilenames(PackageNames);
 
-	// Re-read state at click time and list the files held by someone else.
+	// State may have gone stale since the menu was built, so re-read it before confirming.
 	TArray<FString> LockedLines;
 	for (const FString& Filename : Filenames)
 	{
@@ -118,7 +118,8 @@ void FLoreSourceControlMenu::CheckInOverLockClicked(TArray<FAssetData> SelectedA
 		FString Who;
 		if (State->IsCheckedOutOther(&Who))
 		{
-			LockedLines.Add(FString::Printf(TEXT("%s  (locked by %s)"), *FPaths::GetCleanFilename(Filename), Who.IsEmpty() ? TEXT("another user") : *Who));
+			const FText WhoText = Who.IsEmpty() ? NSLOCTEXT("LoreSourceControl", "AnotherUser", "another user") : FText::FromString(Who);
+			LockedLines.Add(FText::Format(NSLOCTEXT("LoreSourceControl", "LockedLine", "{0}  (locked by {1})"), FText::FromString(FPaths::GetCleanFilename(Filename)), WhoText).ToString());
 		}
 	}
 

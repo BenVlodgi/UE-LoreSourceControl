@@ -23,6 +23,18 @@ bool FLoreSourceControlSettings::SetBinaryPath(const FString& InString)
 	return bChanged;
 }
 
+ELoreBackendMode FLoreSourceControlSettings::GetBackendMode() const
+{
+	FScopeLock ScopeLock(&CriticalSection);
+	return BackendMode;
+}
+
+void FLoreSourceControlSettings::SetBackendMode(ELoreBackendMode InMode)
+{
+	FScopeLock ScopeLock(&CriticalSection);
+	BackendMode = InMode;
+}
+
 bool FLoreSourceControlSettings::IsUsingLocking() const
 {
 	FScopeLock ScopeLock(&CriticalSection);
@@ -66,6 +78,9 @@ void FLoreSourceControlSettings::LoadSettings()
 	FScopeLock ScopeLock(&CriticalSection);
 	const FString& IniFile = SourceControlHelpers::GetSettingsIni();
 	GConfig->GetString(SettingsSection, TEXT("BinaryPath"), BinaryPath, IniFile);
+	int32 ModeValue = static_cast<int32>(ELoreBackendMode::Native);
+	GConfig->GetInt(SettingsSection, TEXT("BackendMode"), ModeValue, IniFile);
+	BackendMode = static_cast<ELoreBackendMode>(FMath::Clamp(ModeValue, 0, 2));
 	GConfig->GetBool(SettingsSection, TEXT("UsingLocking"), bUsingLocking, IniFile);
 	GConfig->GetBool(SettingsSection, TEXT("PushAfterCommit"), bPushAfterCommit, IniFile);
 	GConfig->GetString(SettingsSection, TEXT("Identity"), Identity, IniFile);
@@ -76,6 +91,7 @@ void FLoreSourceControlSettings::SaveSettings() const
 	FScopeLock ScopeLock(&CriticalSection);
 	const FString& IniFile = SourceControlHelpers::GetSettingsIni();
 	GConfig->SetString(SettingsSection, TEXT("BinaryPath"), *BinaryPath, IniFile);
+	GConfig->SetInt(SettingsSection, TEXT("BackendMode"), static_cast<int32>(BackendMode), IniFile);
 	GConfig->SetBool(SettingsSection, TEXT("UsingLocking"), bUsingLocking, IniFile);
 	GConfig->SetBool(SettingsSection, TEXT("PushAfterCommit"), bPushAfterCommit, IniFile);
 	GConfig->SetString(SettingsSection, TEXT("Identity"), *Identity, IniFile);

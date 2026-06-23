@@ -5,6 +5,15 @@
 #include "LoreSourceControlOperations.h"
 #include "LoreSourceControlLog.h"
 
+#if LORE_WITH_LIBLORE
+#include "LoreClient.h"
+#endif
+
+#if WITH_EDITOR && LORE_UE5_8_OR_LATER
+#include "ISourceControlModule.h"
+#include "ISourceControlWindowsModule.h"
+#endif
+
 DEFINE_LOG_CATEGORY(LogLoreSourceControl);
 
 #define LOCTEXT_NAMESPACE "LoreSourceControl"
@@ -14,6 +23,25 @@ static FLoreSourceControlWorkerRef CreateWorker()
 {
 	return MakeShareable(new Type());
 }
+
+#if WITH_EDITOR && LORE_UE5_8_OR_LATER
+// The submit dialog title override is global and single-cast across providers, so defer to the engine default unless Lore is active, then name the branch the commit lands on.
+static FText LoreSubmitDialogTitle(const FSubmitTitleOverrideParameters&)
+{
+	if (ISourceControlModule::Get().GetProvider().GetName() != FName("Lore"))
+	{
+		return NSLOCTEXT("SourceControl.ConfirmSubmit", "Title", "Confirm Submit");
+	}
+
+	const FString Branch = FLoreSourceControlModule::Get().GetProvider().GetBranchName();
+	if (Branch.IsEmpty())
+	{
+		return NSLOCTEXT("LoreSourceControl", "SubmitTitle", "Submit to Lore");
+	}
+
+	return FText::Format(NSLOCTEXT("LoreSourceControl", "SubmitTitleBranch", "Submit to Lore (branch: {0})"), FText::FromString(Branch));
+}
+#endif
 
 void FLoreSourceControlModule::StartupModule()
 {
@@ -37,6 +65,10 @@ void FLoreSourceControlModule::StartupModule()
 #if WITH_EDITOR && LORE_UE5_1_OR_LATER
 	AssetMenu.Register();
 #endif
+
+#if WITH_EDITOR && LORE_UE5_8_OR_LATER
+	ISourceControlWindowsModule::Get().SubmitTitleOverrideDelegate.BindStatic(&LoreSubmitDialogTitle);
+#endif
 }
 
 void FLoreSourceControlModule::ShutdownModule()
@@ -45,8 +77,20 @@ void FLoreSourceControlModule::ShutdownModule()
 	AssetMenu.Unregister();
 #endif
 
+#if WITH_EDITOR && LORE_UE5_8_OR_LATER
+	if (ISourceControlWindowsModule* WindowsModule = ISourceControlWindowsModule::TryGet())
+	{
+		WindowsModule->SubmitTitleOverrideDelegate.Unbind();
+	}
+#endif
+
 	Provider.Close();
 	IModularFeatures::Get().UnregisterModularFeature("SourceControl", &Provider);
+
+#if LORE_WITH_LIBLORE
+	// Stop liblore's worker-thread pool now that the command queue has drained and no synchronous call is in flight.
+	LoreClient::Shutdown();
+#endif
 }
 
 #undef LOCTEXT_NAMESPACE

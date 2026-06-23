@@ -6,6 +6,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/Guid.h"
+#include "Misc/Base64.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
@@ -19,9 +20,76 @@
 #include "LoreSourceControlModule.h"
 #include "LoreSourceControlProvider.h"
 
+#if LORE_WITH_LIBLORE
+#include "LoreCApi.h"
+#include "LoreClient.h"
+#endif
+
 #if WITH_DEV_AUTOMATION_TESTS
 
 // Unit tests: state logic and parsers, no client or server.
+
+#if LORE_WITH_LIBLORE
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreLibVersionTest, "LoreSourceControl.LibLoreVersion", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreLibVersionTest::RunTest(const FString& Parameters)
+{
+	// Prove the native liblore C API links and runs in-process, and that the FLoreClient bridge returns the same version through its own translation unit.
+	const char* RawVersion = lore_version();
+	const FString Version = RawVersion ? FString(UTF8_TO_TCHAR(RawVersion)) : FString();
+	AddInfo(FString::Printf(TEXT("liblore version: %s"), *Version));
+	TestFalse(TEXT("liblore version is non-empty"), Version.IsEmpty());
+	TestTrue(TEXT("liblore version is 0.8.x"), Version.Contains(TEXT("0.8")));
+	TestEqual(TEXT("bridge version matches the raw client version"), LoreClient::GetVersion(), Version);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlAuthTest, "LoreSourceControl.Auth", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSourceControlAuthTest::RunTest(const FString& Parameters)
+{
+	// Exercise the native auth bridge without an identity provider: a token login stores a bearer client-side, a local query reads the identity back, and logout clears it. A throwaway auth URL keeps this out of any real credential, and a JWT carries the identity in its payload so the library can decode it offline.
+	auto Base64Url = [](const FString& Json) -> FString
+	{
+		FTCHARToUTF8 Utf8(*Json);
+		FString Encoded = FBase64::Encode(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+		Encoded.ReplaceInline(TEXT("+"), TEXT("-"));
+		Encoded.ReplaceInline(TEXT("/"), TEXT("_"));
+		Encoded.ReplaceInline(TEXT("="), TEXT(""));
+		return Encoded;
+	};
+
+	const FString AuthUrl = TEXT("ucs-auth://lore-plugin-test.invalid");
+	const FString Header = TEXT("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"lore-plugin-test\"}");
+	// JWTUserInfo (lore-credential) requires iss, sub, name, exp, and aud; the library decodes the payload offline (no signature check) and verifies aud covers the remote domain, so aud lists the auth URL's host.
+	const FString Payload = TEXT("{\"iss\":\"ucs-auth://lore-plugin-test.invalid\",\"sub\":\"lore-plugin-test-user\",\"name\":\"Lore Plugin Test\",\"exp\":4102444800,\"aud\":[\"lore-plugin-test.invalid\"]}");
+	const FString Token = Base64Url(Header) + TEXT(".") + Base64Url(Payload) + TEXT(".") + Base64Url(TEXT("not-a-real-signature"));
+
+	// Remove any leftover token for this throwaway URL first; a local operation that is a no-op when none is stored.
+	FString CleanupError;
+	LoreClient::Logout(FString(), AuthUrl, FString(), CleanupError);
+
+	LoreClient::FAuthUserInfo User;
+	FString LoginError;
+	const bool bLoggedIn = LoreClient::LoginWithToken(FString(), FString(), AuthUrl, Token, TEXT("lore"), User, LoginError);
+	AddInfo(FString::Printf(TEXT("login_with_token offline: %s; id='%s' name='%s'"), bLoggedIn ? TEXT("OK") : TEXT("FAILED"), *User.Id, *User.Name));
+	TestTrue(FString::Printf(TEXT("token login succeeds offline (err: %s)"), *LoginError), bLoggedIn);
+	TestEqual(TEXT("login resolves the token subject as the identity"), User.Id, FString(TEXT("lore-plugin-test-user")));
+
+	// Read the identity back from the local credential store, no network.
+	LoreClient::FAuthUserInfo Queried;
+	FString QueryError;
+	const bool bQueried = LoreClient::GetLocalUserInfo(FString(), AuthUrl, Queried, QueryError);
+	TestTrue(FString::Printf(TEXT("local user info succeeds (err: %s)"), *QueryError), bQueried);
+	TestEqual(TEXT("local user info round-trips the stored identity"), Queried.Id, User.Id);
+
+	// Log out removes the stored token.
+	FString LogoutError;
+	const bool bLoggedOut = LoreClient::Logout(FString(), AuthUrl, FString(), LogoutError);
+	TestTrue(FString::Printf(TEXT("logout clears the stored token (err: %s)"), *LogoutError), bLoggedOut);
+	return true;
+}
+#endif
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSourceControlStateTest, "LoreSourceControl.State", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
@@ -262,7 +330,7 @@ namespace
 #endif
 	}
 
-	// Find loreserver: override, next to the client, or on PATH.
+	// Search order for loreserver: the LORESERVER override, next to the client, then on PATH.
 	FString FindLoreServerBinary(const FString& LoreClient)
 	{
 		TArray<FString> Candidates;
@@ -321,10 +389,12 @@ namespace
 			IFileManager::Get().MakeDirectory(*ConfigDir, true);
 			IFileManager::Get().MakeDirectory(*StoreDir, true);
 
-			// Pin our own store path so it does not clash with a dev server.
+			// Pin every store to our own path so none falls back to the shared <tmp>/lore-server a developer's server also uses. TOML basic strings read backslashes as escapes, so emit the path with forward slashes; the server accepts them on Windows. lock_store must be pinned too, or the repository registry it backs leaks to the shared store.
+			FString StorePath = StoreDir;
+			StorePath.ReplaceInline(TEXT("\\"), TEXT("/"));
 			const FString Toml = FString::Printf(
-				TEXT("[server.quic]\nport = %d\n\n[server.grpc]\nport = %d\n\n[server.http]\nport = %d\n\n[immutable_store.local]\npath = \"%s\"\n\n[mutable_store.local]\npath = \"%s\"\n"),
-				QuicPort, QuicPort, HttpPort, *StoreDir, *StoreDir);
+				TEXT("[server.quic]\nport = %d\n\n[server.grpc]\nport = %d\n\n[server.http]\nport = %d\n\n[immutable_store.local]\npath = \"%s\"\n\n[mutable_store.local]\npath = \"%s\"\n\n[lock_store.local]\npath = \"%s\"\n"),
+				QuicPort, QuicPort, HttpPort, *StorePath, *StorePath, *StorePath);
 			if (!FFileHelper::SaveStringToFile(Toml, *(ConfigDir / TEXT("local.toml"))))
 			{
 				Test.AddError(TEXT("Could not write the test server configuration."));
@@ -395,7 +465,7 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 
 	const FString Binary = FindLoreBinaryPath();
 	FString Version;
-	if (!CheckLoreAvailability(Binary, Version))
+	if (!CheckLoreAvailability(ELoreBackendMode::CommandLine, Binary, Version))
 	{
 		AddError(TEXT("Lore client not found; the integration test requires it."));
 		return false;
@@ -429,28 +499,69 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	{
 		TArray<FLoreSourceControlState> States;
 		TArray<FString> StatusErrors;
-		RunUpdateStatus(Binary, Root, TEXT("test@example.com"), bLocking, Files, StatusErrors, States);
+		RunUpdateStatus(ELoreBackendMode::Automatic, Binary, Root, TEXT("test@example.com"), bLocking, Files, StatusErrors, States);
 		return States.Num() == 1 ? States[0] : FLoreSourceControlState(File);
 	};
 
+#if LORE_WITH_LIBLORE
+	// The liblore status path must classify identically to the CLI JSON path for the same files; the migration depends on the two staying in lock step.
+	auto CompareStatusPaths = [&](const TArray<FString>& InAbsoluteFiles, const TCHAR* Label)
+	{
+		const TArray<FString> RelativeFiles = RelativeFilenames(InAbsoluteFiles, Root);
+
+		TArray<FString> CliResults, CliErrors;
+		RunCommand(TEXT("status"), Binary, Root, { TEXT("--scan"), TEXT("--json") }, RelativeFiles, CliResults, CliErrors);
+		TMap<FString, ELoreWorkingCopyState::Type> CliStates;
+		bool bCliAhead = false;
+		ParseStatusForTest(CliResults, CliStates, bCliAhead);
+
+		LoreClient::FStatusResult ClientResult;
+		FString ClientError;
+		const bool bClientOk = LoreClient::GetStatus(Root, TEXT("test@example.com"), RelativeFiles, true, ClientResult, ClientError);
+		TestTrue(FString::Printf(TEXT("liblore status succeeds (%s)"), Label), bClientOk);
+		if (!bClientOk)
+		{
+			AddInfo(FString::Printf(TEXT("liblore GetStatus failed (%s) for root '%s': %s"), Label, *Root, *ClientError));
+		}
+		TMap<FString, ELoreWorkingCopyState::Type> ClientStates;
+		bool bClientAhead = false;
+		ParseStatusFromClient(ClientResult, ClientStates, bClientAhead);
+
+		TestEqual(FString::Printf(TEXT("liblore and CLI agree on reported file count (%s)"), Label), ClientStates.Num(), CliStates.Num());
+		TestEqual(FString::Printf(TEXT("liblore and CLI agree on remote-ahead (%s)"), Label), bClientAhead, bCliAhead);
+		for (const TPair<FString, ELoreWorkingCopyState::Type>& Pair : CliStates)
+		{
+			const ELoreWorkingCopyState::Type* Found = ClientStates.Find(Pair.Key);
+			TestNotNull(*FString::Printf(TEXT("liblore reports %s (%s)"), *Pair.Key, Label), Found);
+			if (Found)
+			{
+				TestEqual(*FString::Printf(TEXT("liblore and CLI agree on state for %s (%s)"), *Pair.Key, Label), (int32)*Found, (int32)Pair.Value);
+			}
+		}
+	};
+#endif
+
 	TestEqual(TEXT("Untracked file reads as not controlled"), (int32)StateOf(false).WorkingCopyState, (int32)ELoreWorkingCopyState::NotControlled);
 
-	// Out-of-tree paths (engine content) are skipped, not failed, and read as not controlled.
+	// Out-of-tree paths (engine content) are skipped, not failed, and read as Unknown so the submit dialog never offers them for add.
 	{
 		const FString OutsidePath = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreOutsideProbe"), TEXT("outside.txt"));
 		TArray<FLoreSourceControlState> MixedStates;
 		TArray<FString> MixedErrors;
-		const bool bMixedOk = RunUpdateStatus(Binary, Root, TEXT("test@example.com"), false, { File, OutsidePath }, MixedErrors, MixedStates);
+		const bool bMixedOk = RunUpdateStatus(ELoreBackendMode::Automatic, Binary, Root, TEXT("test@example.com"), false, { File, OutsidePath }, MixedErrors, MixedStates);
 		TestTrue(TEXT("Status with an out-of-tree path still succeeds"), bMixedOk);
 		TestEqual(TEXT("Both paths return a state"), MixedStates.Num(), 2);
 		if (MixedStates.Num() == 2)
 		{
-			TestEqual(TEXT("Out-of-tree path reads as not controlled"), (int32)MixedStates[1].WorkingCopyState, (int32)ELoreWorkingCopyState::NotControlled);
+			TestEqual(TEXT("Out-of-tree path reads as Unknown"), (int32)MixedStates[1].WorkingCopyState, (int32)ELoreWorkingCopyState::Unknown);
 		}
 	}
 
 	RunCommand(TEXT("stage"), Binary, Root, TArray<FString>(), { TEXT("hello.txt") }, Results, Errors);
 	TestEqual(TEXT("Staged file reads as added"), (int32)StateOf(false).WorkingCopyState, (int32)ELoreWorkingCopyState::Added);
+#if LORE_WITH_LIBLORE
+	CompareStatusPaths(Files, TEXT("staged add"));
+#endif
 
 	const bool bCommitted = RunCommand(TEXT("commit"), Binary, Root, { TEXT("\"integration commit\"") }, TArray<FString>(), Results, Errors);
 	TestTrue(TEXT("Commit succeeds"), bCommitted);
@@ -461,20 +572,40 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Edited committed file reads as modified"), (int32)StateOf(false).WorkingCopyState, (int32)ELoreWorkingCopyState::Modified);
 	FFileHelper::SaveStringToFile(TEXT("Hello Lore"), *File);
 
-	// Commit is local, so push then sync exercise the server.
-	const bool bPushed = RunCommand(TEXT("push"), Binary, Root, TArray<FString>(), TArray<FString>(), Results, Errors);
+	// Commit is local, so push then sync exercise the server. These go through the liblore wrappers on Win64.
+	const bool bPushed = PushBranch(ELoreBackendMode::Automatic, Binary, Root, Errors);
 	TestTrue(TEXT("Push succeeds"), bPushed);
-	const bool bSynced = RunCommand(TEXT("sync"), Binary, Root, TArray<FString>(), TArray<FString>(), Results, Errors);
+	const bool bSynced = SyncWorkingTree(ELoreBackendMode::Automatic, Binary, Root, Errors);
 	TestTrue(TEXT("Sync succeeds"), bSynced);
 	TestTrue(TEXT("Synced file is current"), StateOf(false).IsCurrent());
 
+	// Backend modes: native connect reads branch and remote flags with no command line; command-line mode forces the subprocess.
+#if LORE_WITH_LIBLORE
+	{
+		FString NativeBranch;
+		const bool bNativeBranchOk = GetBranchName(ELoreBackendMode::Native, Binary, Root, NativeBranch);
+		TestTrue(TEXT("Native branch read succeeds"), bNativeBranchOk);
+		TestFalse(TEXT("Native branch is non-empty"), NativeBranch.IsEmpty());
+		bool bNativeAvailable = false, bNativeAuthorized = false;
+		GetRemoteAuthState(ELoreBackendMode::Native, Binary, Root, bNativeAvailable, bNativeAuthorized);
+		TestTrue(TEXT("Native remote-auth read reports the remote reachable"), bNativeAvailable);
+	}
+#endif
+	{
+		TArray<FLoreSourceControlState> CliModeStates;
+		TArray<FString> CliModeErrors;
+		const bool bCliModeOk = RunUpdateStatus(ELoreBackendMode::CommandLine, Binary, Root, TEXT("test@example.com"), false, Files, CliModeErrors, CliModeStates);
+		TestTrue(TEXT("Command-line-mode status succeeds"), bCliModeOk);
+	}
+
 	TLoreSourceControlHistory History;
-	RunGetHistory(Binary, Root, File, Errors, History);
+	RunGetHistory(ELoreBackendMode::Automatic, Binary, Root, File, Errors, History);
 	TestTrue(TEXT("History has at least one revision"), History.Num() >= 1);
 	if (History.Num() >= 1)
 	{
 		TestFalse(TEXT("Revision carries a commit id"), History[0]->GetRevision().IsEmpty());
 		TestEqual(TEXT("Revision description is the commit message"), History[0]->GetDescription(), FString(TEXT("integration commit")));
+		TestEqual(TEXT("Revision author is the commit identity"), History[0]->GetUserName(), FString(TEXT("test@example.com")));
 		TestEqual(TEXT("Creation revision action reads as Add"), History[0]->GetAction(), FString(TEXT("Add")));
 		TestTrue(TEXT("Revision date parsed (year is current era)"), History[0]->GetDate().GetYear() > 2000);
 
@@ -488,6 +619,23 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 		FString DiffTempRepeat;
 		TestTrue(TEXT("Repeat extraction reuses the existing temp file"), History[0]->Get(DiffTempRepeat));
 		TestEqual(TEXT("Repeat extraction yields the same path"), DiffTempRepeat, DiffTemp);
+
+#if LORE_WITH_LIBLORE
+		// Confirm the native file write works on its own, not only because the CLI fallback covers for it.
+		const FString NativeOut = FPaths::Combine(Root, TEXT("native_write_probe.txt"));
+		IFileManager::Get().Delete(*NativeOut, false, true);
+		FString WriteErr;
+		const bool bNativeWrite = LoreClient::WriteFile(Root, RelativeFilename(File, Root), History[0]->CommitId, NativeOut, WriteErr);
+		TestTrue(TEXT("liblore file write succeeds"), bNativeWrite);
+		if (!bNativeWrite)
+		{
+			AddInfo(FString::Printf(TEXT("liblore WriteFile failed: %s"), *WriteErr));
+		}
+		else
+		{
+			TestTrue(TEXT("native-written file is non-empty"), IFileManager::Get().FileSize(*NativeOut) > 0);
+		}
+#endif
 	}
 
 	// A second commit makes the latest revision an edit, which the JSON history reports as the "keep" action; confirm it reads as Keep (Edit).
@@ -495,7 +643,7 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	RunCommand(TEXT("stage"), Binary, Root, TArray<FString>(), { TEXT("hello.txt") }, Results, Errors);
 	RunCommand(TEXT("commit"), Binary, Root, { TEXT("\"edit commit\"") }, TArray<FString>(), Results, Errors);
 	TLoreSourceControlHistory History2;
-	RunGetHistory(Binary, Root, File, Errors, History2);
+	RunGetHistory(ELoreBackendMode::Automatic, Binary, Root, File, Errors, History2);
 	TestTrue(TEXT("History has two revisions after a second commit"), History2.Num() >= 2);
 	if (History2.Num() >= 2)
 	{
@@ -506,6 +654,33 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	// With authentication off the lock owner is unattributable and reads as this user's own.
 	const ELoreLockState::Type LockState = StateOf(true).LockState;
 	TestEqual(TEXT("Locked file reads as checked out by this user"), (int32)LockState, (int32)ELoreLockState::Locked);
+#if LORE_WITH_LIBLORE
+	// Differential: the liblore lock read must report the same locked paths as the CLI lock-status command. Owner strings are unattributable here, so compare the locked set, not the owner literal.
+	{
+		const TArray<FString> LockRel = RelativeFilenames(Files, Root);
+		TArray<FString> CliLockResults, CliLockErrors;
+		RunCommand(TEXT("lock status"), Binary, Root, { TEXT("--json") }, LockRel, CliLockResults, CliLockErrors);
+		TMap<FString, FString> CliLocks;
+		ParseLocksForTest(CliLockResults, CliLocks);
+
+		TArray<LoreClient::FLockStatus> ClientLockList;
+		FString LockErr;
+		const bool bLockOk = LoreClient::GetLockStatus(Root, LockRel, ClientLockList, LockErr);
+		TestTrue(TEXT("liblore lock status succeeds"), bLockOk);
+		if (!bLockOk)
+		{
+			AddInfo(FString::Printf(TEXT("liblore GetLockStatus failed: %s"), *LockErr));
+		}
+		TMap<FString, FString> ClientLocks;
+		ParseLocksFromClient(ClientLockList, ClientLocks);
+
+		TestEqual(TEXT("liblore and CLI agree on locked file count"), ClientLocks.Num(), CliLocks.Num());
+		for (const TPair<FString, FString>& Pair : CliLocks)
+		{
+			TestTrue(*FString::Printf(TEXT("liblore reports a lock on %s"), *Pair.Key), ClientLocks.Contains(Pair.Key));
+		}
+	}
+#endif
 
 	RunCommand(TEXT("lock release"), Binary, Root, TArray<FString>(), { TEXT("hello.txt") }, Results, Errors);
 
@@ -520,7 +695,8 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	FFileHelper::SaveStringToFile(TEXT("alpha"), *FileA);
 	FFileHelper::SaveStringToFile(TEXT("beta"), *FileB);
 	RunCommand(TEXT("stage"), Binary, Root, TArray<FString>(), { TEXT("alpha.txt"), TEXT("beta.txt") }, Results, Errors);
-	RunCommand(TEXT("unstage"), Binary, Root, { TEXT(".") }, TArray<FString>(), Results, Errors);
+	// Exercise liblore unstage-all (the repository root path) on Win64; the assertions below confirm beta is not left staged.
+	UnstageFiles(ELoreBackendMode::Automatic, Binary, Root, { TEXT(".") }, Errors);
 	RunCommand(TEXT("stage"), Binary, Root, TArray<FString>(), { TEXT("alpha.txt") }, Results, Errors);
 	RunCommand(TEXT("commit"), Binary, Root, { TEXT("\"partial submit\"") }, TArray<FString>(), Results, Errors);
 
@@ -528,11 +704,14 @@ bool FLoreSourceControlIntegrationTest::RunTest(const FString& Parameters)
 	{
 		TArray<FLoreSourceControlState> PartialStates;
 		TArray<FString> PartialErrors;
-		RunUpdateStatus(Binary, Root, TEXT("test@example.com"), false, { Absolute }, PartialErrors, PartialStates);
+		RunUpdateStatus(ELoreBackendMode::Automatic, Binary, Root, TEXT("test@example.com"), false, { Absolute }, PartialErrors, PartialStates);
 		return PartialStates.Num() == 1 ? PartialStates[0].WorkingCopyState : ELoreWorkingCopyState::Unknown;
 	};
 	TestEqual(TEXT("Submitted file is committed"), (int32)WorkingStateOf(FileA), (int32)ELoreWorkingCopyState::Unchanged);
 	TestEqual(TEXT("Unselected file is not committed"), (int32)WorkingStateOf(FileB), (int32)ELoreWorkingCopyState::NotControlled);
+#if LORE_WITH_LIBLORE
+	CompareStatusPaths({ FileA, FileB }, TEXT("post-partial-submit"));
+#endif
 
 	return true;
 }
@@ -546,7 +725,7 @@ bool FLoreSourceControlProviderTest::RunTest(const FString& Parameters)
 
 	const FString Binary = FindLoreBinaryPath();
 	FString Version;
-	if (!CheckLoreAvailability(Binary, Version))
+	if (!CheckLoreAvailability(ELoreBackendMode::CommandLine, Binary, Version))
 	{
 		AddError(TEXT("Lore client not found; the provider test requires it."));
 		return false;
@@ -610,7 +789,7 @@ bool FLoreSourceControlProviderTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("CheckIn through the provider succeeds"), (int32)CheckInResult, (int32)ECommandResult::Succeeded);
 	TestFalse(TEXT("CheckIn sets a non-empty success message"), CheckInOp->GetSuccessMessage().IsEmpty());
 
-	// Check out: an auth-off lock reads as this user's own.
+	// Check out: with authentication off a lock reads as this user's own.
 	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
 	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
 	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };

@@ -63,3 +63,8 @@ If you don't already have the Lore CLI installed, you can download the latest bi
 - Available on GitHub [EpicGames/lore/releases](https://github.com/EpicGames/lore/releases).
 - Windows: `irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex`
 - macOS, Linux: `curl -fsSL https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.sh | bash`
+
+
+#### 2.2 Connect to a Lore Server
+
+The plugin pushes to and syncs from a Lore server. Point it at your team's existing server, or stand up your own by following [Deploy a local Lore Server](https://epicgames.github.io/lore/how-to/deploy-local-lore-server/).

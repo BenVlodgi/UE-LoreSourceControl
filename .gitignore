@@ -11,3 +11,6 @@ Build/
 
 # Built data for maps
 *_BuiltData.uasset
+
+# liblore static library (large build artifact; rebuilt by the liblore build step)
+Source/ThirdParty/LoreLib/lib/

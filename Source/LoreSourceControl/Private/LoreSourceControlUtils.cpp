@@ -6,6 +6,7 @@
 #include "LoreSourceControlModule.h"
 #include "LoreSourceControlProvider.h"
 #include "LoreSourceControlLog.h"
+#include "LoreSourceControlSettings.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -14,6 +15,10 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+
+#if LORE_WITH_LIBLORE
+#include "LoreClient.h"
+#endif
 
 namespace LoreSourceControlConstants
 {
@@ -127,6 +132,22 @@ namespace
 		return bSucceeded;
 	}
 
+	// Whether this mode attempts the native library. Only possible when liblore is compiled in.
+	bool UseNativeBackend(ELoreBackendMode InMode)
+	{
+#if LORE_WITH_LIBLORE
+		return InMode != ELoreBackendMode::CommandLine;
+#else
+		return false;
+#endif
+	}
+
+	// Whether a failed native call retries on the command line. Only Automatic does.
+	bool FallsBackToCommandLine(ELoreBackendMode InMode)
+	{
+		return InMode == ELoreBackendMode::Automatic;
+	}
+
 	void SplitLines(const FString& InText, TArray<FString>& OutLines)
 	{
 		InText.ParseIntoArrayLines(OutLines, false);
@@ -136,7 +157,7 @@ namespace
 		}
 	}
 
-	// Parse a Lore date like "Thu, 18 Jun 2026 07:27:40 +0000"
+	// Lore date shape: "Thu, 18 Jun 2026 07:27:40 +0000"
 	bool ParseLoreDate(const FString& InText, FDateTime& OutDate)
 	{
 		if (FDateTime::ParseHttpDate(InText, OutDate))
@@ -161,7 +182,6 @@ namespace
 		return false;
 	}
 
-	// Parse `--json` event line into its tag and data object.
 	bool ParseJsonEvent(const FString& InLine, FString& OutTag, TSharedPtr<FJsonObject>& OutData)
 	{
 		const FString Trimmed = InLine.TrimStartAndEnd();
@@ -187,7 +207,7 @@ namespace
 		return true;
 	}
 
-	// Map `repositoryStatusFile` event to a working-copy state. "keep" means tracked, so dirtiness decides modified versus unchanged.
+	// "keep" means tracked, so dirtiness decides modified versus unchanged.
 	ELoreWorkingCopyState::Type StatusStateFromEvent(const FString& InAction, bool bStaged, bool bDirty, bool bConflict)
 	{
 		if (bConflict)
@@ -313,7 +333,7 @@ namespace
 		}
 	}
 
-	// Read the remote reachability and authorization flags from the status revision header.
+	// The reachability and authorization flags live only on the status revision header, not the per-file events.
 	void ParseRemoteAuthResults(const TArray<FString>& InResults, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
 	{
 		bOutRemoteAvailable = false;
@@ -340,10 +360,69 @@ namespace
 namespace LoreSourceControlUtils
 {
 
+// Defined further down; forward-declared for the liblore history converter that appears earlier in the file.
+FString LoreActionToString(const FString& InAction);
+
 void ParseStatusForTest(const TArray<FString>& InResults, TMap<FString, ELoreWorkingCopyState::Type>& OutStates, bool& bOutRemoteAhead)
 {
 	ParseStatusResults(InResults, OutStates, bOutRemoteAhead);
 }
+
+#if LORE_WITH_LIBLORE
+void ParseStatusFromClient(const LoreClient::FStatusResult& InResult, TMap<FString, ELoreWorkingCopyState::Type>& OutStates, bool& bOutRemoteAhead)
+{
+	bOutRemoteAhead = InResult.bRemoteAhead;
+	for (const LoreClient::FStatusFile& File : InResult.Files)
+	{
+		if (File.bIsDirectory || File.Path.IsEmpty())
+		{
+			continue;
+		}
+		FString Path = File.Path;
+		Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+		if (IsTransientRepoPath(Path))
+		{
+			continue;
+		}
+		OutStates.Add(Path, StatusStateFromEvent(File.Action, File.bStaged, File.bDirty, File.bConflict));
+	}
+}
+
+void ParseLocksFromClient(const TArray<LoreClient::FLockStatus>& InLocks, TMap<FString, FString>& OutLocks)
+{
+	for (const LoreClient::FLockStatus& Lock : InLocks)
+	{
+		if (Lock.Path.IsEmpty())
+		{
+			continue;
+		}
+		FString Path = Lock.Path;
+		Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+		OutLocks.Add(Path, Lock.Owner);
+	}
+}
+
+void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FHistoryRevision>& InRevisions, const FString& InAbsoluteFile, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TLoreSourceControlHistory& OutHistory)
+{
+	for (const LoreClient::FHistoryRevision& In : InRevisions)
+	{
+		TSharedRef<FLoreSourceControlRevision, ESPMode::ThreadSafe> Revision = MakeShared<FLoreSourceControlRevision, ESPMode::ThreadSafe>();
+		Revision->Filename = InAbsoluteFile;
+		Revision->PathToLoreBinary = InPathToLoreBinary;
+		Revision->PathToRepositoryRoot = InRepositoryRoot;
+		Revision->BackendMode = InMode;
+		Revision->CommitId = In.CommitId;
+		Revision->ShortCommitId = In.CommitId.Left(8);
+		Revision->RevisionNumber = In.RevisionNumber;
+		Revision->Action = LoreActionToString(In.Action);
+		Revision->Description = In.Description;
+		Revision->UserName = In.UserName;
+		Revision->Date = In.Date;
+		Revision->FileSize = In.FileSize;
+		OutHistory.Add(Revision);
+	}
+}
+#endif
 
 void ParseLocksForTest(const TArray<FString>& InResults, TMap<FString, FString>& OutLocks)
 {
@@ -474,8 +553,16 @@ FString GetPinnedVersion()
 	return LoreSourceControlConstants::PinnedVersion;
 }
 
-bool CheckLoreAvailability(const FString& InPathToLoreBinary, FString& OutVersion)
+bool CheckLoreAvailability(ELoreBackendMode InMode, const FString& InPathToLoreBinary, FString& OutVersion)
 {
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		// The library reports its own version; a non-empty answer means it loaded and runs.
+		OutVersion = LoreClient::GetVersion();
+		return !OutVersion.IsEmpty();
+	}
+#endif
 	FString Results, Errors;
 	const bool bOk = RunCommandInternalRaw(TEXT("--version"), InPathToLoreBinary, FString(), TArray<FString>(), TArray<FString>(), Results, Errors);
 	OutVersion = Results.TrimStartAndEnd();
@@ -542,8 +629,22 @@ void GetRepositoryConfig(const FString& InRepositoryRoot, FString& OutRemoteUrl,
 	}
 }
 
-bool GetBranchName(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, FString& OutBranchName)
+bool GetBranchName(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, FString& OutBranchName)
 {
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		// The status revision header carries the branch, so read it with no tree scan.
+		LoreClient::FStatusResult Result;
+		FString Error;
+		if (LoreClient::GetStatus(InRepositoryRoot, FString(), TArray<FString>(), false, Result, Error))
+		{
+			OutBranchName = Result.BranchName;
+			return !OutBranchName.IsEmpty();
+		}
+		return false;
+	}
+#endif
 	TArray<FString> Results, Errors;
 	if (!RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, Errors))
 	{
@@ -580,6 +681,81 @@ void LaunchLogin(const FString& InPathToLoreBinary, const FString& InRepositoryR
 	}
 }
 
+bool LoginWithToken(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InRemoteUrl, const FString& InToken, const FString& InTokenType, FString& OutError)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		LoreClient::FAuthUserInfo User;
+		if (LoreClient::LoginWithToken(InRepositoryRoot, InRemoteUrl, FString(), InToken, InTokenType, User, OutError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore token login failed, falling back to the CLI: %s"), *OutError);
+	}
+#endif
+	TArray<FString> Results, Errors;
+	const TArray<FString> Parameters = { TEXT("--token-type"), InTokenType, TEXT("--token"), InToken };
+	const bool bOk = RunCommand(TEXT("auth login"), InPathToLoreBinary, InRepositoryRoot, Parameters, TArray<FString>(), Results, Errors);
+	if (!bOk)
+	{
+		OutError = Errors.Num() ? FString::Join(Errors, TEXT("; ")) : TEXT("token login failed");
+	}
+	return bOk;
+}
+
+bool LoginInteractive(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InRemoteUrl, FString& OutError)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString AuthUrl;
+		LoreClient::FAuthUserInfo User;
+		if (LoreClient::LoginInteractive(InRepositoryRoot, InRemoteUrl, false, AuthUrl, User, OutError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore interactive login failed, falling back to the CLI: %s"), *OutError);
+	}
+#endif
+	// The command-line browser login is detached and gives no synchronous result, so report it as launched.
+	LaunchLogin(InPathToLoreBinary, InRepositoryRoot, InRemoteUrl);
+	return true;
+}
+
+bool Logout(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, FString& OutError)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		if (LoreClient::Logout(InRepositoryRoot, FString(), FString(), OutError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore logout failed, falling back to the CLI: %s"), *OutError);
+	}
+#endif
+	TArray<FString> Results, Errors;
+	const bool bOk = RunCommand(TEXT("auth logout"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, Errors);
+	if (!bOk)
+	{
+		OutError = Errors.Num() ? FString::Join(Errors, TEXT("; ")) : TEXT("logout failed");
+	}
+	return bOk;
+}
+
 bool RunCommand(const FString& InCommand, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
 	FString Results, Errors;
@@ -591,17 +767,30 @@ bool RunCommand(const FString& InCommand, const FString& InPathToLoreBinary, con
 	if (!bOk && ErrorLines.Num() == 0)
 	{
 		// On a silent failure, give the user something actionable.
-		OutErrorMessages.Add(FString::Printf(TEXT("The lore command '%s' failed with no output. Confirm the Lore CLI path in the Lore settings and that the server is reachable."), *InCommand));
+		OutErrorMessages.Add(FText::Format(NSLOCTEXT("LoreSourceControl", "CommandNoOutput", "The lore command '{0}' failed with no output. Confirm the Lore CLI path in the Lore settings and that the server is reachable."), FText::FromString(InCommand)).ToString());
 	}
 
 	return bOk;
 }
 
-void GetRemoteAuthState(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
+void GetRemoteAuthState(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, bool& bOutRemoteAvailable, bool& bOutRemoteAuthorized)
 {
-	// Plain status, no --scan: a light read of the revision header flags, not a tree walk that persists dirty state.
 	bOutRemoteAvailable = false;
 	bOutRemoteAuthorized = false;
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		LoreClient::FStatusResult Result;
+		FString Error;
+		if (LoreClient::GetStatus(InRepositoryRoot, FString(), TArray<FString>(), false, Result, Error))
+		{
+			bOutRemoteAvailable = Result.bRemoteAvailable;
+			bOutRemoteAuthorized = Result.bRemoteAuthorized;
+		}
+		return;
+	}
+#endif
+	// Plain status, no --scan: a light read of the revision header flags, not a tree walk that persists dirty state.
 	TArray<FString> Results, Errors;
 	if (!RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, TArray<FString>(), Results, Errors))
 	{
@@ -611,9 +800,9 @@ void GetRemoteAuthState(const FString& InPathToLoreBinary, const FString& InRepo
 	ParseRemoteAuthResults(Results, bOutRemoteAvailable, bOutRemoteAuthorized);
 }
 
-bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InIdentity, bool bInUsingLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FLoreSourceControlState>& OutStates)
+bool RunUpdateStatus(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InIdentity, bool bInUsingLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FLoreSourceControlState>& OutStates)
 {
-	// The editor queries content outside the working tree; Lore rejects out-of-tree paths, so only in-tree paths reach the client and the rest read as not controlled.
+	// The editor queries content outside the working tree; Lore rejects out-of-tree paths, so only in-tree paths reach the client and the rest read as Unknown, never offered for add.
 	FString RootFull = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
 	RootFull.ReplaceInline(TEXT("\\"), TEXT("/"));
 	if (!RootFull.EndsWith(TEXT("/")))
@@ -647,18 +836,71 @@ bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InReposit
 	bool bOk = true;
 	if (InTreeFiles.Num() > 0)
 	{
-		TArray<FString> Parameters;
-		Parameters.Add(TEXT("--scan"));
-		Parameters.Add(TEXT("--json"));
-		TArray<FString> Results;
-		bOk = RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, Parameters, RelativeFiles, Results, OutErrorMessages);
-		ParseStatusResults(Results, Parsed, bBehindRemote);
+		bool bStatusRead = false;
+#if LORE_WITH_LIBLORE
+		if (UseNativeBackend(InMode))
+		{
+			LoreClient::FStatusResult ClientResult;
+			FString ClientError;
+			if (LoreClient::GetStatus(InRepositoryRoot, InIdentity, RelativeFiles, true, ClientResult, ClientError))
+			{
+				ParseStatusFromClient(ClientResult, Parsed, bBehindRemote);
+				bStatusRead = true;
+			}
+			else if (!FallsBackToCommandLine(InMode))
+			{
+				// Native mode does not retry on the command line; report the failure and stop.
+				OutErrorMessages.Add(ClientError);
+				bOk = false;
+				bStatusRead = true;
+			}
+			else
+			{
+				UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore status failed, falling back to the CLI: %s"), *ClientError);
+			}
+		}
+#endif
+		if (!bStatusRead)
+		{
+			TArray<FString> Parameters;
+			Parameters.Add(TEXT("--scan"));
+			Parameters.Add(TEXT("--json"));
+			TArray<FString> Results;
+			bOk = RunCommand(TEXT("status"), InPathToLoreBinary, InRepositoryRoot, Parameters, RelativeFiles, Results, OutErrorMessages);
+			ParseStatusResults(Results, Parsed, bBehindRemote);
+		}
 
 		if (bInUsingLocking)
 		{
-			TArray<FString> LockResults, LockErrors;
-			RunCommand(TEXT("lock status"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, RelativeFiles, LockResults, LockErrors);
-			ParseLockResults(LockResults, Locks);
+			bool bLocksRead = false;
+#if LORE_WITH_LIBLORE
+			if (UseNativeBackend(InMode))
+			{
+				TArray<LoreClient::FLockStatus> ClientLocks;
+				FString LockError;
+				if (LoreClient::GetLockStatus(InRepositoryRoot, RelativeFiles, ClientLocks, LockError))
+				{
+					ParseLocksFromClient(ClientLocks, Locks);
+					bLocksRead = true;
+				}
+				else if (!FallsBackToCommandLine(InMode))
+				{
+					// Native mode does not retry on the command line; lock owners stay unknown for this pass.
+					UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore lock status failed in native mode: %s"), *LockError);
+					bLocksRead = true;
+				}
+				else
+				{
+					UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore lock status failed, falling back to the CLI: %s"), *LockError);
+				}
+			}
+#endif
+			if (!bLocksRead)
+			{
+				TArray<FString> LockResults, LockErrors;
+				RunCommand(TEXT("lock status"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, RelativeFiles, LockResults, LockErrors);
+				ParseLockResults(LockResults, Locks);
+			}
 		}
 	}
 
@@ -673,7 +915,8 @@ bool RunUpdateStatus(const FString& InPathToLoreBinary, const FString& InReposit
 
 		if (!IsInTree(InFiles[Index]))
 		{
-			State.WorkingCopyState = ELoreWorkingCopyState::NotControlled;
+			// An out-of-tree file is not part of this repository. The submit dialog offers any not-controlled file for add, so engine and plugin content must read Unknown to stay out of that list.
+			State.WorkingCopyState = ELoreWorkingCopyState::Unknown;
 			OutStates.Add(MoveTemp(State));
 			continue;
 		}
@@ -722,34 +965,54 @@ bool CollectCheckInBlockers(const TArray<FLoreSourceControlState>& InStates, boo
 	{
 		if (!bAllowOverLock && State.LockState == ELoreLockState::LockedOther)
 		{
-			OutMessages.Add(FString::Printf(TEXT("Cannot submit %s: locked by %s."), *FPaths::GetCleanFilename(State.GetFilename()), *State.LockUser));
+			OutMessages.Add(FText::Format(NSLOCTEXT("LoreSourceControl", "BlockerLocked", "Cannot submit {0}: locked by {1}."), FText::FromString(FPaths::GetCleanFilename(State.GetFilename())), FText::FromString(State.LockUser)).ToString());
 		}
 		else if (State.IsConflicted())
 		{
-			OutMessages.Add(FString::Printf(TEXT("Cannot submit %s: unresolved conflict. Resolve, then submit."), *FPaths::GetCleanFilename(State.GetFilename())));
+			OutMessages.Add(FText::Format(NSLOCTEXT("LoreSourceControl", "BlockerConflict", "Cannot submit {0}: unresolved conflict. Resolve, then submit."), FText::FromString(FPaths::GetCleanFilename(State.GetFilename()))).ToString());
 		}
 	}
 
 	return OutMessages.Num() > 0;
 }
 
-// Get the user-facing action label shown in the file history column from a raw Lore action string.
 FString LoreActionToString(const FString& InAction)
 {
-	static const TMap<FString, FString> Labels = {
-		{ LoreJson::ActionValues::Add,    TEXT("Add") },
-		{ LoreJson::ActionValues::Keep,   TEXT("Keep (Edit)") }, // Lore keeps an edited-but-present file as "keep"
-		{ LoreJson::ActionValues::Delete, TEXT("Delete") },
-		{ LoreJson::ActionValues::Move,   TEXT("Move") },
-		{ LoreJson::ActionValues::Copy,   TEXT("Copy") },
+	// Labels are localizable text; they convert to a string at the ISourceControlRevision::GetAction boundary, which returns a string reference.
+	static const TMap<FString, FText> Labels = {
+		{ LoreJson::ActionValues::Add,    NSLOCTEXT("LoreSourceControl", "HistoryActionAdd", "Add") },
+		{ LoreJson::ActionValues::Keep,   NSLOCTEXT("LoreSourceControl", "HistoryActionKeep", "Keep (Edit)") }, // Lore keeps an edited-but-present file as "keep"
+		{ LoreJson::ActionValues::Delete, NSLOCTEXT("LoreSourceControl", "HistoryActionDelete", "Delete") },
+		{ LoreJson::ActionValues::Move,   NSLOCTEXT("LoreSourceControl", "HistoryActionMove", "Move") },
+		{ LoreJson::ActionValues::Copy,   NSLOCTEXT("LoreSourceControl", "HistoryActionCopy", "Copy") },
 	};
-	const FString* Label = Labels.Find(InAction);
-	return Label ? *Label : InAction;
+	const FText* Label = Labels.Find(InAction);
+	return Label ? Label->ToString() : InAction;
 }
 
-bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory)
+bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory)
 {
 	const FString RelativeFile = RelativeFilename(InFile, InRepositoryRoot);
+
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		TArray<LoreClient::FHistoryRevision> ClientRevisions;
+		FString ClientError;
+		if (LoreClient::GetHistory(InRepositoryRoot, RelativeFile, ClientRevisions, ClientError))
+		{
+			BuildHistoryFromClient(InMode, ClientRevisions, FPaths::ConvertRelativePathToFull(InFile), InPathToLoreBinary, InRepositoryRoot, OutHistory);
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore file history failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+
 	TArray<FString> Results;
 	if (!RunCommand(TEXT("file history"), InPathToLoreBinary, InRepositoryRoot, { TEXT("--json") }, { RelativeFile }, Results, OutErrorMessages))
 	{
@@ -780,6 +1043,7 @@ bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositor
 			Current->Filename = Absolute;
 			Current->PathToLoreBinary = InPathToLoreBinary;
 			Current->PathToRepositoryRoot = InRepositoryRoot;
+			Current->BackendMode = InMode;
 			FString Revision;
 			Data->TryGetStringField(LoreJson::Revision, Revision);
 			Current->CommitId = Revision;
@@ -828,6 +1092,216 @@ bool RunGetHistory(const FString& InPathToLoreBinary, const FString& InRepositor
 		OutHistory.Add(Current.ToSharedRef());
 	}
 	return true;
+}
+
+bool StageFiles(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InRelativeFiles, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::Stage(InRepositoryRoot, InRelativeFiles, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore stage failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("stage"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), InRelativeFiles, Results, OutErrorMessages);
+}
+
+bool UnstageFiles(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InRelativeFiles, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::Unstage(InRepositoryRoot, InRelativeFiles, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore unstage failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("unstage"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), InRelativeFiles, Results, OutErrorMessages);
+}
+
+bool ResetFiles(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InRelativeFiles, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::Reset(InRepositoryRoot, InRelativeFiles, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore reset failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("reset"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), InRelativeFiles, Results, OutErrorMessages);
+}
+
+bool AcquireLocks(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InRelativeFiles, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::LockAcquire(InRepositoryRoot, InRelativeFiles, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore lock acquire failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("lock acquire"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), InRelativeFiles, Results, OutErrorMessages);
+}
+
+bool ReleaseLocks(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const TArray<FString>& InRelativeFiles, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::LockRelease(InRepositoryRoot, InRelativeFiles, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore lock release failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("lock release"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), InRelativeFiles, Results, OutErrorMessages);
+}
+
+bool CommitChanges(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InIdentity, const FString& InMessage, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		// Commit is not idempotent: a partial liblore commit can record the revision before reporting failure, so a retry would mint a duplicate. Never fall back, even in Automatic; surface the error instead.
+		FString ClientError;
+		if (!LoreClient::Commit(InRepositoryRoot, InIdentity, InMessage, ClientError))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		return true;
+	}
+#endif
+	// Keep the message safe inside the CLI's quoted argument; the native path takes it verbatim.
+	FString Message = InMessage;
+	Message.ReplaceInline(TEXT("\""), TEXT("'"));
+	Message.ReplaceInline(TEXT("\r"), TEXT(" "));
+	Message.ReplaceInline(TEXT("\n"), TEXT(" "));
+	TArray<FString> CommitParameters;
+	CommitParameters.Add(FString::Printf(TEXT("\"%s\""), *Message));
+	if (!InIdentity.IsEmpty())
+	{
+		CommitParameters.Add(TEXT("--identity"));
+		CommitParameters.Add(FString::Printf(TEXT("\"%s\""), *InIdentity));
+	}
+	TArray<FString> Results;
+	return RunCommand(TEXT("commit"), InPathToLoreBinary, InRepositoryRoot, CommitParameters, TArray<FString>(), Results, OutErrorMessages);
+}
+
+bool PushBranch(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::Push(InRepositoryRoot, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore push failed, falling back to the CLI: %s"), *ClientError);
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("push"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, OutErrorMessages);
+}
+
+bool SyncWorkingTree(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		// Sync can auto-merge and auto-commit, so a partial liblore sync must not be retried against an already-advanced tree. Never fall back, even in Automatic; surface the error instead.
+		FString ClientError;
+		if (!LoreClient::Sync(InRepositoryRoot, ClientError))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		return true;
+	}
+#endif
+	TArray<FString> Results;
+	return RunCommand(TEXT("sync"), InPathToLoreBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, OutErrorMessages);
+}
+
+bool WriteRevisionFile(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InRelativeFile, const FString& InRevision, const FString& InOutputPath, TArray<FString>& OutErrorMessages)
+{
+#if LORE_WITH_LIBLORE
+	if (UseNativeBackend(InMode))
+	{
+		FString ClientError;
+		if (LoreClient::WriteFile(InRepositoryRoot, InRelativeFile, InRevision, InOutputPath, ClientError))
+		{
+			return true;
+		}
+		if (!FallsBackToCommandLine(InMode))
+		{
+			OutErrorMessages.Add(ClientError);
+			return false;
+		}
+		UE_LOG(LogLoreSourceControl, Verbose, TEXT("liblore file write failed, falling back to the CLI: %s"), *ClientError);
+		// The client refuses to overwrite, so clear any partial output liblore left before the CLI retry.
+		IFileManager::Get().Delete(*InOutputPath, false, true);
+	}
+#endif
+	TArray<FString> Parameters;
+	Parameters.Add(FString::Printf(TEXT("--revision %s"), *InRevision));
+	Parameters.Add(FString::Printf(TEXT("--path \"%s\""), *InRelativeFile));
+	Parameters.Add(FString::Printf(TEXT("--output \"%s\""), *InOutputPath));
+	TArray<FString> Results;
+	return RunCommand(TEXT("file write"), InPathToLoreBinary, InRepositoryRoot, Parameters, TArray<FString>(), Results, OutErrorMessages);
 }
 
 bool UpdateCachedStates(const TArray<FLoreSourceControlState>& InStates)

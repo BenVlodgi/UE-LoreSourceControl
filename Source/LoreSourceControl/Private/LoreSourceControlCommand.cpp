@@ -15,7 +15,7 @@ FLoreSourceControlCommand::FLoreSourceControlCommand(const FSourceControlOperati
 	const FLoreSourceControlProvider& Provider = Module.GetProvider();
 	PathToLoreBinary = Provider.GetLoreBinaryPath();
 	PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
-	// The settings identity, when set, overrides the working tree configuration.
+	// Settings identity, when set, overrides the working tree configuration.
 	Identity = Module.GetSettings().GetIdentity();
 	if (Identity.IsEmpty())
 	{
@@ -23,6 +23,7 @@ FLoreSourceControlCommand::FLoreSourceControlCommand(const FSourceControlOperati
 	}
 	bUsingLocking = Module.GetSettings().IsUsingLocking();
 	bPushAfterCommit = Module.GetSettings().IsPushAfterCommit();
+	BackendMode = Module.GetSettings().GetBackendMode();
 }
 
 bool FLoreSourceControlCommand::DoWork()

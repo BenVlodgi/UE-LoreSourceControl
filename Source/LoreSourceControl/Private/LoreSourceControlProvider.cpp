@@ -12,6 +12,9 @@
 #include "ScopedSourceControlProgress.h"
 #include "Misc/Paths.h"
 #include "Misc/QueuedThreadPool.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
+#include "Async/Async.h"
 #include "UObject/Package.h"
 #if LORE_UE5_0_OR_LATER
 #include "UObject/ObjectSaveContext.h"
@@ -47,14 +50,15 @@ void FLoreSourceControlProvider::Init(bool bForceConnection)
 	}
 	PathToLoreBinary = LoreSourceControlUtils::ResolveBinaryPath(StoredPath);
 
-	bLoreAvailable = LoreSourceControlUtils::CheckLoreAvailability(PathToLoreBinary, LoreVersion);
+	const ELoreBackendMode Mode = Module.GetSettings().GetBackendMode();
+	bLoreAvailable = LoreSourceControlUtils::CheckLoreAvailability(Mode, PathToLoreBinary, LoreVersion);
 
 	bLoreRepositoryFound = LoreSourceControlUtils::GetRepositoryRoot(FPaths::ProjectDir(), PathToRepositoryRoot);
 	if (bLoreRepositoryFound)
 	{
 		// Read identity and remote before any status query, so our own locks attribute right.
 		LoreSourceControlUtils::GetRepositoryConfig(PathToRepositoryRoot, RemoteUrl, Identity);
-		LoreSourceControlUtils::GetBranchName(PathToLoreBinary, PathToRepositoryRoot, BranchName);
+		LoreSourceControlUtils::GetBranchName(Mode, PathToLoreBinary, PathToRepositoryRoot, BranchName);
 	}
 
 	if (!OnPackageSavedHandle.IsValid())
@@ -355,7 +359,7 @@ TOptional<int> FLoreSourceControlProvider::GetNumLocalChanges() const
 void FLoreSourceControlProvider::Tick()
 {
 	bool bStatesChanged = false;
-	for (int32 Index = 0; Index < CommandQueue.Num(); /* in-loop */)
+	for (int32 Index = 0; Index < CommandQueue.Num(); )
 	{
 		FLoreSourceControlCommand* Command = CommandQueue[Index];
 		if (Command->bExecuteProcessed.GetValue() > 0)
@@ -396,6 +400,27 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 		];
 	};
 
+	// One mutually-exclusive option in the backend selector.
+	auto ModeOption = [](const FText& Label, ELoreBackendMode ThisMode) -> TSharedRef<SWidget>
+	{
+		return SNew(SCheckBox)
+			.IsChecked_Lambda([ThisMode]() { return FLoreSourceControlModule::Get().GetSettings().GetBackendMode() == ThisMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+			.OnCheckStateChanged_Lambda([ThisMode](ECheckBoxState NewState)
+			{
+				// Ignore the deselect click; selecting another option moves the choice.
+				if (NewState != ECheckBoxState::Checked) { return; }
+				FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
+				Module.AccessSettings().SetBackendMode(ThisMode);
+				Module.AccessSettings().SaveSettings();
+				Module.GetProvider().Init();
+			})
+			[ SNew(STextBlock).Text(Label) ];
+	};
+
+	// Hold the token field's text for the sign-in handler; the shared buffer lives as long as the captured lambdas.
+	TSharedRef<FString> TokenBuffer = MakeShared<FString>();
+	TSharedRef<FString> TokenTypeBuffer = MakeShared<FString>(FString(TEXT("lore")));
+
 	return SNew(SVerticalBox)
 	// Connection information, discovered at connect.
 	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f)
@@ -429,7 +454,7 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 			})
 		]
 	]
-	// Offer sign-in only when the server reports it needs a login the client lacks.
+	// Authentication: status, browser sign-in, and sign-out. Sign-in and sign-out run off the game thread, since the native browser flow blocks until it completes.
 	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 4.0f, 2.0f, 2.0f)
 	[
 		SNew(SHorizontalBox)
@@ -447,11 +472,11 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 					return LOCTEXT("AuthUnreachable", "Server not reachable");
 				}
 				return Provider.IsRemoteAuthorized()
-					? LOCTEXT("AuthNotRequired", "Not required")
+					? LOCTEXT("AuthSignedIn", "Signed in")
 					: LOCTEXT("AuthRequired", "Required, not signed in");
 			})
 		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
 		[
 			SNew(SButton)
 			.Visibility_Lambda([]()
@@ -459,18 +484,153 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 				const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
 				return (Provider.IsRemoteAvailable() && !Provider.IsRemoteAuthorized()) ? EVisibility::Visible : EVisibility::Collapsed;
 			})
-			.ToolTipText(LOCTEXT("LoginTip", "Sign in to the Lore server. Opens a browser."))
+			.ToolTipText(LOCTEXT("LoginTip", "Sign in to the Lore server through a browser."))
 			.OnClicked_Lambda([]()
 			{
-				const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+				FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
+				const FLoreSourceControlProvider& Provider = Module.GetProvider();
+				const ELoreBackendMode Mode = Module.GetSettings().GetBackendMode();
+				const FString Binary = Provider.GetLoreBinaryPath();
+				const FString Root = Provider.GetPathToRepositoryRoot();
+				const FString Remote = Provider.GetRemoteUrl();
 				FNotificationInfo Info(LOCTEXT("LoginStarting", "Opening a browser to sign in to Lore..."));
 				Info.ExpireDuration = 4.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
-				LoreSourceControlUtils::LaunchLogin(Provider.GetLoreBinaryPath(), Provider.GetPathToRepositoryRoot(), Provider.GetRemoteUrl());
+				AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Mode, Binary, Root, Remote]()
+				{
+					FString Error;
+					const bool bOk = LoreSourceControlUtils::LoginInteractive(Mode, Binary, Root, Remote, Error);
+					bool bAvailable = false, bAuthorized = false;
+					if (bOk)
+					{
+						LoreSourceControlUtils::GetRemoteAuthState(Mode, Binary, Root, bAvailable, bAuthorized);
+					}
+					AsyncTask(ENamedThreads::GameThread, [bOk, Error, bAvailable, bAuthorized]()
+					{
+						if (!bOk)
+						{
+							FNotificationInfo Fail(FText::Format(LOCTEXT("LoginFail", "Lore sign-in failed: {0}"), FText::FromString(Error)));
+							Fail.ExpireDuration = 6.0f;
+							FSlateNotificationManager::Get().AddNotification(Fail);
+						}
+						else
+						{
+							FLoreSourceControlModule::Get().GetProvider().SetRemoteAuthState(bAvailable, bAuthorized);
+						}
+					});
+				});
 				return FReply::Handled();
 			})
 			[
 				SNew(STextBlock).Text(LOCTEXT("Login", "Log in"))
+			]
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+		[
+			SNew(SButton)
+			.Visibility_Lambda([]()
+			{
+				return FLoreSourceControlModule::Get().GetProvider().IsRemoteAuthorized() ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+			.ToolTipText(LOCTEXT("LogoutTip", "Remove the stored Lore credentials."))
+			.OnClicked_Lambda([]()
+			{
+				FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
+				const FLoreSourceControlProvider& Provider = Module.GetProvider();
+				const ELoreBackendMode Mode = Module.GetSettings().GetBackendMode();
+				const FString Binary = Provider.GetLoreBinaryPath();
+				const FString Root = Provider.GetPathToRepositoryRoot();
+				AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Mode, Binary, Root]()
+				{
+					FString Error;
+					LoreSourceControlUtils::Logout(Mode, Binary, Root, Error);
+					bool bAvailable = false, bAuthorized = false;
+					LoreSourceControlUtils::GetRemoteAuthState(Mode, Binary, Root, bAvailable, bAuthorized);
+					AsyncTask(ENamedThreads::GameThread, [bAvailable, bAuthorized]()
+					{
+						FLoreSourceControlModule::Get().GetProvider().SetRemoteAuthState(bAvailable, bAuthorized);
+					});
+				});
+				return FReply::Handled();
+			})
+			[
+				SNew(STextBlock).Text(LOCTEXT("Logout", "Sign out"))
+			]
+		]
+	]
+	// Token sign-in: the non-interactive native path, for a server that issues tokens.
+	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f)
+	[
+		SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+		[
+			SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("TokenLabel", "Token"))
+		]
+		+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+		[
+			SNew(SEditableTextBox)
+			.IsPassword(true)
+			.HintText(LOCTEXT("TokenHint", "Paste a Lore auth token"))
+			.OnTextChanged_Lambda([TokenBuffer](const FText& InText) { *TokenBuffer = InText.ToString(); })
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+		[
+			SNew(SBox).WidthOverride(70.0f)
+			[
+				SNew(SEditableTextBox)
+				.ToolTipText(LOCTEXT("TokenTypeTip", "Token type: lore, api-key, or eg1."))
+				.Text_Lambda([TokenTypeBuffer]() { return FText::FromString(*TokenTypeBuffer); })
+				.OnTextChanged_Lambda([TokenTypeBuffer](const FText& InText) { *TokenTypeBuffer = InText.ToString(); })
+			]
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+		[
+			SNew(SButton)
+			.ToolTipText(LOCTEXT("TokenLoginTip", "Sign in with the pasted token. No browser."))
+			.OnClicked_Lambda([TokenBuffer, TokenTypeBuffer]()
+			{
+				FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
+				const FLoreSourceControlProvider& Provider = Module.GetProvider();
+				const ELoreBackendMode Mode = Module.GetSettings().GetBackendMode();
+				const FString Binary = Provider.GetLoreBinaryPath();
+				const FString Root = Provider.GetPathToRepositoryRoot();
+				const FString Remote = Provider.GetRemoteUrl();
+				const FString Token = *TokenBuffer;
+				const FString TokenType = TokenTypeBuffer->IsEmpty() ? FString(TEXT("lore")) : *TokenTypeBuffer;
+				if (Token.IsEmpty())
+				{
+					FNotificationInfo Empty(LOCTEXT("TokenEmpty", "Paste a token first."));
+					Empty.ExpireDuration = 4.0f;
+					FSlateNotificationManager::Get().AddNotification(Empty);
+					return FReply::Handled();
+				}
+				FNotificationInfo Info(LOCTEXT("TokenSigningIn", "Signing in to Lore with a token..."));
+				Info.ExpireDuration = 4.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Mode, Binary, Root, Remote, Token, TokenType]()
+				{
+					FString Error;
+					const bool bOk = LoreSourceControlUtils::LoginWithToken(Mode, Binary, Root, Remote, Token, TokenType, Error);
+					bool bAvailable = false, bAuthorized = false;
+					if (bOk)
+					{
+						LoreSourceControlUtils::GetRemoteAuthState(Mode, Binary, Root, bAvailable, bAuthorized);
+					}
+					AsyncTask(ENamedThreads::GameThread, [bOk, Error, bAvailable, bAuthorized]()
+					{
+						FNotificationInfo Result(bOk ? LOCTEXT("TokenLoginOk", "Signed in to Lore.") : FText::Format(LOCTEXT("TokenLoginFail", "Token sign-in failed: {0}"), FText::FromString(Error)));
+						Result.ExpireDuration = 6.0f;
+						FSlateNotificationManager::Get().AddNotification(Result);
+						if (bOk)
+						{
+							FLoreSourceControlModule::Get().GetProvider().SetRemoteAuthState(bAvailable, bAuthorized);
+						}
+					});
+				});
+				return FReply::Handled();
+			})
+			[
+				SNew(STextBlock).Text(LOCTEXT("TokenLogin", "Sign in with token"))
 			]
 		]
 	]
@@ -503,7 +663,7 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 			SNew(STextBlock).Text(LOCTEXT("PushAfterCommit", "Push to server when submitting"))
 		]
 	]
-	// Advanced: the client path and the downloader
+	// Advanced: the backend selector, plus the client path and downloader. Folded away because the native default is what almost every project wants.
 	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 8.0f, 2.0f, 2.0f)
 	[
 		SNew(SExpandableArea)
@@ -511,53 +671,74 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 		.AreaTitle(LOCTEXT("Advanced", "Advanced"))
 		.BodyContent()
 		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			SNew(SVerticalBox)
+			// Backend: which path operations run through. Native uses no command-line client.
+			+ SVerticalBox::Slot().AutoHeight().Padding(2.0f)
 			[
-				SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("LorePathLabel", "Lore Path"))
-			]
-			+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
-			[
-				SNew(SEditableTextBox)
-				.Text_Lambda([]() { return FText::FromString(FLoreSourceControlModule::Get().GetSettings().GetBinaryPath()); })
-				.OnTextCommitted_Lambda([](const FText& InText, ETextCommit::Type)
-				{
-					FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
-					Module.AccessSettings().SetBinaryPath(InText.ToString());
-					Module.AccessSettings().SaveSettings();
-					Module.GetProvider().Init();
-				})
-			]
-			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 0, 0)
-			[
-				SNew(SButton)
-				.ToolTipText(LOCTEXT("DownloadClientTip", "Fetch the latest Lore CLI release from GitHub into the plugin."))
-				.IsEnabled_Lambda([]() { return LoreSourceControlDownload::IsRunning() || !LoreSourceControlUtils::IsBundledClientPresent(); })
-				.OnClicked_Lambda([]()
-				{
-					if (LoreSourceControlDownload::IsRunning())
-					{
-						LoreSourceControlDownload::Cancel();
-					}
-					else
-					{
-						LoreSourceControlDownload::Start();
-					}
-					return FReply::Handled();
-				})
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
 				[
-					SNew(STextBlock).Text_Lambda([]() -> FText
+					SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("BackendLabel", "Backend"))
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 12, 0)
+				[ ModeOption(LOCTEXT("ModeNative", "Native library"), ELoreBackendMode::Native) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 12, 0)
+				[ ModeOption(LOCTEXT("ModeCommandLine", "Command line"), ELoreBackendMode::CommandLine) ]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[ ModeOption(LOCTEXT("ModeAutomatic", "Automatic"), ELoreBackendMode::Automatic) ]
+			]
+			// Client path and downloader are meaningless under the native default, where no command-line client runs.
+			+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 8.0f, 2.0f, 2.0f)
+			[
+				SNew(SHorizontalBox)
+				.Visibility_Lambda([]() { return FLoreSourceControlModule::Get().GetSettings().GetBackendMode() != ELoreBackendMode::Native ? EVisibility::Visible : EVisibility::Collapsed; })
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+				[
+					SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("LorePathLabel", "Lore Path"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+				[
+					SNew(SEditableTextBox)
+					.Text_Lambda([]() { return FText::FromString(FLoreSourceControlModule::Get().GetSettings().GetBinaryPath()); })
+					.OnTextCommitted_Lambda([](const FText& InText, ETextCommit::Type)
+					{
+						FLoreSourceControlModule& Module = FLoreSourceControlModule::Get();
+						Module.AccessSettings().SetBinaryPath(InText.ToString());
+						Module.AccessSettings().SaveSettings();
+						Module.GetProvider().Init();
+					})
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 0, 0)
+				[
+					SNew(SButton)
+					.ToolTipText(LOCTEXT("DownloadClientTip", "Fetch the latest Lore CLI release from GitHub into the plugin."))
+					.IsEnabled_Lambda([]() { return LoreSourceControlDownload::IsRunning() || !LoreSourceControlUtils::IsBundledClientPresent(); })
+					.OnClicked_Lambda([]()
 					{
 						if (LoreSourceControlDownload::IsRunning())
 						{
-							return LOCTEXT("CancelDownload", "Cancel download");
+							LoreSourceControlDownload::Cancel();
 						}
-						if (LoreSourceControlUtils::IsBundledClientPresent())
+						else
 						{
-							return LOCTEXT("ClientInstalled", "Lore CLI installed");
+							LoreSourceControlDownload::Start();
 						}
-						return LOCTEXT("DownloadLatest", "Download latest Lore CLI");
+						return FReply::Handled();
 					})
+					[
+						SNew(STextBlock).Text_Lambda([]() -> FText
+						{
+							if (LoreSourceControlDownload::IsRunning())
+							{
+								return LOCTEXT("CancelDownload", "Cancel download");
+							}
+							if (LoreSourceControlUtils::IsBundledClientPresent())
+							{
+								return LOCTEXT("ClientInstalled", "Lore CLI installed");
+							}
+							return LOCTEXT("DownloadLatest", "Download latest Lore CLI");
+						})
+					]
 				]
 			]
 		]
@@ -612,17 +793,47 @@ TSharedPtr<ILoreSourceControlWorker, ESPMode::ThreadSafe> FLoreSourceControlProv
 
 ECommandResult::Type FLoreSourceControlProvider::ExecuteSynchronousCommand(FLoreSourceControlCommand& InCommand, const FText& Task)
 {
-	// No progress dialog for a synchronous command; the editor that requested it already shows one, so a second here is the double popup. Perforce suppresses it the same way.
-	FScopedSourceControlProgress Progress(FText::GetEmpty());
-	InCommand.DoWork();
-	const bool bStatesChanged = InCommand.Worker->UpdateStates();
-	const ECommandResult::Type Result = InCommand.ReturnResults();
-	if (bStatesChanged)
+	ECommandResult::Type Result = ECommandResult::Failed;
+
+	// Run the worker on the pool and wait on the game thread, pumping Slate so the editor stays painted instead of freezing on an inline call, the way the engine Git and Perforce providers drive synchronous commands. The progress window only appears once an operation runs past a short threshold, so fast native operations stay silent while a slow one shows a cancellable dialog.
 	{
-		OnSourceControlStateChanged.Broadcast();
+		const double StartSeconds = FPlatformTime::Seconds();
+		TUniquePtr<FScopedSourceControlProgress> Progress;
+
+		IssueCommand(InCommand);
+
+		while (InCommand.bExecuteProcessed.GetValue() == 0)
+		{
+			if (!Progress && FPlatformTime::Seconds() - StartSeconds > 0.5)
+			{
+				Progress = MakeUnique<FScopedSourceControlProgress>(Task);
+			}
+
+			Tick();
+			if (Progress)
+			{
+				Progress->Tick();
+			}
+			FPlatformProcess::Sleep(0.01f);
+		}
+
+		// One more Tick to update states and clear the finished command from the queue.
+		Tick();
+
+		if (InCommand.bCommandSuccessful)
+		{
+			Result = ECommandResult::Succeeded;
+		}
 	}
 
+	// A synchronous command is never auto-deleted; remove it from the queue if it is still there, then delete.
+	check(!InCommand.bAutoDelete);
+	if (CommandQueue.Contains(&InCommand))
+	{
+		CommandQueue.Remove(&InCommand);
+	}
 	delete &InCommand;
+
 	return Result;
 }
 

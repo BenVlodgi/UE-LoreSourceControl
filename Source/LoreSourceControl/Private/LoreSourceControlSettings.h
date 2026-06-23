@@ -4,6 +4,14 @@
 
 #include "CoreMinimal.h"
 
+/** Which backend the plugin drives Lore through. */
+enum class ELoreBackendMode : uint8
+{
+	Native,       // liblore in process; the command line is never invoked
+	CommandLine,  // the lore subprocess only; liblore is never called
+	Automatic,    // native first, command line when a native call returns an error
+};
+
 /** Machine-local settings, persisted to the source control settings ini. */
 class FLoreSourceControlSettings
 {
@@ -11,6 +19,10 @@ public:
 	/** Path to the Lore executable. Empty means resolve from PATH. */
 	FString GetBinaryPath() const;
 	bool SetBinaryPath(const FString& InString);
+
+	/** Which backend operations run through. Native by default, so a default install never needs the command-line client. */
+	ELoreBackendMode GetBackendMode() const;
+	void SetBackendMode(ELoreBackendMode InMode);
 
 	/** Whether check out acquires a Lore lock and binary assets are read-only until checked out. */
 	bool IsUsingLocking() const;
@@ -34,6 +46,9 @@ private:
 
 	/** Path to the Lore binary */
 	FString BinaryPath;
+
+	/** Which backend operations run through */
+	ELoreBackendMode BackendMode = ELoreBackendMode::Native;
 
 	/** True when check out takes a lock and binary assets are read-only until checked out */
 	bool bUsingLocking = true;

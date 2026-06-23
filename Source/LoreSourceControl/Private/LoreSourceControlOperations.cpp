@@ -15,7 +15,7 @@ namespace
 	void RefreshStates(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceControlState>& OutStates)
 	{
 		OutStates.Reset();
-		LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, InCommand.ErrorMessages, OutStates);
+		LoreSourceControlUtils::RunUpdateStatus(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, InCommand.ErrorMessages, OutStates);
 	}
 
 	void SetFilesReadOnly(const TArray<FString>& InFiles, bool bReadOnly)
@@ -62,13 +62,13 @@ FName FLoreConnectWorker::GetName() const { return "Connect"; }
 
 bool FLoreConnectWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
-	bAvailable = LoreSourceControlUtils::CheckLoreAvailability(InCommand.PathToLoreBinary, LoreVersion);
+	bAvailable = LoreSourceControlUtils::CheckLoreAvailability(InCommand.BackendMode, InCommand.PathToLoreBinary, LoreVersion);
 	bRepositoryFound = LoreSourceControlUtils::GetRepositoryRoot(FPaths::ProjectDir(), RepositoryRoot);
 	if (bRepositoryFound)
 	{
 		LoreSourceControlUtils::GetRepositoryConfig(RepositoryRoot, RemoteUrl, Identity);
-		LoreSourceControlUtils::GetBranchName(InCommand.PathToLoreBinary, RepositoryRoot, BranchName);
-		LoreSourceControlUtils::GetRemoteAuthState(InCommand.PathToLoreBinary, RepositoryRoot, bRemoteAvailable, bRemoteAuthorized);
+		LoreSourceControlUtils::GetBranchName(InCommand.BackendMode, InCommand.PathToLoreBinary, RepositoryRoot, BranchName);
+		LoreSourceControlUtils::GetRemoteAuthState(InCommand.BackendMode, InCommand.PathToLoreBinary, RepositoryRoot, bRemoteAvailable, bRemoteAuthorized);
 	}
 
 	InCommand.bCommandSuccessful = bAvailable && bRepositoryFound;
@@ -104,7 +104,7 @@ bool FLoreUpdateStatusWorker::Execute(FLoreSourceControlCommand& InCommand)
 		return true;
 	}
 
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, InCommand.ErrorMessages, States);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunUpdateStatus(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, InCommand.ErrorMessages, States);
 
 	// Re-assert read-only each status pass, since Lore never sets it itself.
 	if (InCommand.bUsingLocking)
@@ -118,7 +118,7 @@ bool FLoreUpdateStatusWorker::Execute(FLoreSourceControlCommand& InCommand)
 		for (FLoreSourceControlState& State : States)
 		{
 			TLoreSourceControlHistory History;
-			LoreSourceControlUtils::RunGetHistory(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, State.LocalFilename, InCommand.ErrorMessages, History);
+			LoreSourceControlUtils::RunGetHistory(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, State.LocalFilename, InCommand.ErrorMessages, History);
 			State.History = History;
 		}
 	}
@@ -138,8 +138,7 @@ FName FLoreCheckOutWorker::GetName() const { return "CheckOut"; }
 bool FLoreCheckOutWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("lock acquire"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::AcquireLocks(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 	if (InCommand.bCommandSuccessful)
 	{
 		// A lock does not change writability, so clear read-only ourselves.
@@ -162,8 +161,7 @@ FName FLoreMarkForAddWorker::GetName() const { return "MarkForAdd"; }
 bool FLoreMarkForAddWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("stage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::StageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 	RefreshStates(InCommand, States);
 	return InCommand.bCommandSuccessful;
 }
@@ -179,7 +177,7 @@ FName FLoreDeleteWorker::GetName() const { return "Delete"; }
 
 bool FLoreDeleteWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
-	// Delete on disk, then stage the removal.
+	// Stage records a removal only once the file is gone on disk, so delete first.
 	IFileManager& FileManager = IFileManager::Get();
 	for (const FString& File : InCommand.Files)
 	{
@@ -190,8 +188,7 @@ bool FLoreDeleteWorker::Execute(FLoreSourceControlCommand& InCommand)
 	}
 
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("stage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::StageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 	RefreshStates(InCommand, States);
 	return InCommand.bCommandSuccessful;
 }
@@ -208,11 +205,11 @@ FName FLoreRevertWorker::GetName() const { return "Revert"; }
 bool FLoreRevertWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
 
-	// Unstage, then reset on-disk content to the committed revision.
-	LoreSourceControlUtils::RunCommand(TEXT("unstage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+	// Unstage, then reset on-disk content to the committed revision. Unstage failures are cleanup (an unstaged path has nothing to unstage), so keep them out of the user-facing list.
+	TArray<FString> UnstageCleanupErrors;
+	LoreSourceControlUtils::UnstageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, UnstageCleanupErrors);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::ResetFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 
 	RefreshStates(InCommand, States);
 	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking)
@@ -229,7 +226,7 @@ bool FLoreRevertWorker::Execute(FLoreSourceControlCommand& InCommand)
 		}
 		if (LockedRelative.Num() > 0)
 		{
-			LoreSourceControlUtils::RunCommand(TEXT("lock release"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), LockedRelative, Results, InCommand.ErrorMessages);
+			LoreSourceControlUtils::ReleaseLocks(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, LockedRelative, InCommand.ErrorMessages);
 		}
 		ApplyReadOnlyFromStates(States);
 	}
@@ -247,8 +244,7 @@ FName FLoreSyncWorker::GetName() const { return "Sync"; }
 
 bool FLoreSyncWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
-	TArray<FString> Results;
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("sync"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::SyncWorkingTree(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.ErrorMessages);
 	RefreshStates(InCommand, States);
 	return InCommand.bCommandSuccessful;
 }
@@ -271,12 +267,11 @@ bool FLoreSyncWorker::UpdateStates() const
 static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceControlState>& States, bool bForceOverLock)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
 
 	// Guard on a fresh status: refuse before staging if a submitted file is locked by another (unless forcing over it) or conflicted. A behind-the-remote file is allowed; its commit is local and a rejected push is reported.
 	TArray<FLoreSourceControlState> GuardStates;
 	TArray<FString> GuardErrors;
-	LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, GuardErrors, GuardStates);
+	LoreSourceControlUtils::RunUpdateStatus(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, GuardErrors, GuardStates);
 	if (LoreSourceControlUtils::CollectCheckInBlockers(GuardStates, bForceOverLock, InCommand.ErrorMessages))
 	{
 		InCommand.bCommandSuccessful = false;
@@ -286,9 +281,9 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 
 	// Lore commits the whole staged set, so unstage everything, then stage only our files. Unstage errors are cleanup, keep them out of the user-facing list.
 	TArray<FString> UnstageErrors;
-	LoreSourceControlUtils::RunCommand(TEXT("unstage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, { TEXT(".") }, TArray<FString>(), Results, UnstageErrors);
+	LoreSourceControlUtils::UnstageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, { TEXT(".") }, UnstageErrors);
 
-	if (!LoreSourceControlUtils::RunCommand(TEXT("stage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages))
+	if (!LoreSourceControlUtils::StageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages))
 	{
 		InCommand.bCommandSuccessful = false;
 		RefreshStates(InCommand, States);
@@ -298,7 +293,7 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 	// Commit only records when a staged file actually changed; otherwise nothing to submit.
 	TArray<FLoreSourceControlState> SelectedStates;
 	TArray<FString> SelectedStatusErrors;
-	LoreSourceControlUtils::RunUpdateStatus(InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, SelectedStatusErrors, SelectedStates);
+	LoreSourceControlUtils::RunUpdateStatus(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, InCommand.bUsingLocking, InCommand.Files, SelectedStatusErrors, SelectedStates);
 	const bool bHasChangeToSubmit = SelectedStates.ContainsByPredicate([](const FLoreSourceControlState& State)
 	{
 		return State.WorkingCopyState == ELoreWorkingCopyState::Added
@@ -309,34 +304,23 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 	});
 	if (!bHasChangeToSubmit)
 	{
-		StaticCastSharedRef<FCheckIn>(InCommand.Operation)->SetSuccessMessage(NSLOCTEXT("LoreSourceControl", "CheckInNoChanges", "No changes to submit."));
+		StaticCastSharedRef<FCheckIn>(InCommand.Operation)->SetSuccessMessage(NSLOCTEXT("LoreSourceControl", "CheckInNoChanges", "Nothing to commit: the selected files have no changes, so no revision was created. They stay checked out; revert to release the lock."));
 		InCommand.bCommandSuccessful = true;
 		RefreshStates(InCommand, States);
 		return true;
 	}
 
-	const FString Description = StaticCastSharedRef<FCheckIn>(InCommand.Operation)->GetDescription().ToString();
-	FString Message = Description;
-	Message.ReplaceInline(TEXT("\""), TEXT("'"));
-	Message.ReplaceInline(TEXT("\r"), TEXT(" "));
-	Message.ReplaceInline(TEXT("\n"), TEXT(" "));
+	const FString Message = StaticCastSharedRef<FCheckIn>(InCommand.Operation)->GetDescription().ToString();
 
-	TArray<FString> CommitParameters;
-	CommitParameters.Add(FString::Printf(TEXT("\"%s\""), *Message));
-	// Lore will not commit without an identity, so pass the configured one.
-	if (!InCommand.Identity.IsEmpty())
-	{
-		CommitParameters.Add(TEXT("--identity"));
-		CommitParameters.Add(FString::Printf(TEXT("\"%s\""), *InCommand.Identity));
-	}
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("commit"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, CommitParameters, TArray<FString>(), Results, InCommand.ErrorMessages);
+	// Lore will not commit without an identity, so the configured one is passed through. CommitChanges escapes the message only for the CLI path; the native path records it verbatim.
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::CommitChanges(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.Identity, Message, InCommand.ErrorMessages);
 
 	if (InCommand.bCommandSuccessful && InCommand.bPushAfterCommit)
 	{
-		const bool bPushed = LoreSourceControlUtils::RunCommand(TEXT("push"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, InCommand.ErrorMessages);
+		const bool bPushed = LoreSourceControlUtils::PushBranch(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, InCommand.ErrorMessages);
 		if (!bPushed)
 		{
-			InCommand.ErrorMessages.Add(TEXT("Commit succeeded locally but push failed. Sync, resolve, and submit again."));
+			InCommand.ErrorMessages.Add(NSLOCTEXT("LoreSourceControl", "PushFailedAfterCommit", "Commit succeeded locally but push failed. Sync, resolve, and submit again.").ToString());
 			InCommand.bCommandSuccessful = false;
 		}
 	}
@@ -351,7 +335,7 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 	// Do not release a lock held by someone else when forcing over it; we never held it.
 	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking && !bKeepCheckedOut && !bForceOverLock)
 	{
-		LoreSourceControlUtils::RunCommand(TEXT("lock release"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+		LoreSourceControlUtils::ReleaseLocks(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 	}
 
 	if (InCommand.bCommandSuccessful)
@@ -365,7 +349,7 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 			InCommand.bPushAfterCommit
 				? NSLOCTEXT("LoreSourceControl", "CheckInPushed", "Submitted {0} {0}|plural(one=file,other=files) to Lore: \"{1}\" ({2})")
 				: NSLOCTEXT("LoreSourceControl", "CheckInCommitted", "Committed {0} {0}|plural(one=file,other=files) locally: \"{1}\" ({2})"),
-			FText::AsNumber(RelativeFiles.Num()), FText::FromString(Description), FText::FromString(FString::Join(Names, TEXT(", "))));
+			FText::AsNumber(RelativeFiles.Num()), FText::FromString(Message), FText::FromString(FString::Join(Names, TEXT(", "))));
 		StaticCastSharedRef<FCheckIn>(InCommand.Operation)->SetSuccessMessage(SuccessMessage);
 	}
 
@@ -411,10 +395,9 @@ bool FLoreCopyWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
 	const FString Destination = StaticCastSharedRef<FCopy>(InCommand.Operation)->GetDestination();
 	const FString RelativeDestination = LoreSourceControlUtils::RelativeFilename(Destination, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
 	TArray<FString> Targets;
 	Targets.Add(RelativeDestination);
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("stage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), Targets, Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::StageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, Targets, InCommand.ErrorMessages);
 
 	InCommand.Files.Add(Destination);
 	RefreshStates(InCommand, States);
@@ -433,8 +416,7 @@ FName FLoreResolveWorker::GetName() const { return "Resolve"; }
 bool FLoreResolveWorker::Execute(FLoreSourceControlCommand& InCommand)
 {
 	const TArray<FString> RelativeFiles = LoreSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
-	TArray<FString> Results;
-	InCommand.bCommandSuccessful = LoreSourceControlUtils::RunCommand(TEXT("stage"), InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), RelativeFiles, Results, InCommand.ErrorMessages);
+	InCommand.bCommandSuccessful = LoreSourceControlUtils::StageFiles(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
 	RefreshStates(InCommand, States);
 	return InCommand.bCommandSuccessful;
 }

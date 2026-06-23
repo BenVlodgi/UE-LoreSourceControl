@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "LoreSourceControlVersion.h"
+#include "LoreSourceControlSettings.h"
 #include "ISourceControlRevision.h"
 
 /** One historical revision of a file, from `lore file history`. */
@@ -35,13 +36,13 @@ public:
 	/** Absolute path of file this revision belongs to. */
 	FString Filename;
 
-	/** The Lore revision hash signature. */
+	/** Lore revision hash. */
 	FString CommitId;
 
-	/** Short form of hash for display. */
+	/** Hash truncated for display. */
 	FString ShortCommitId;
 
-	/** The Lore revision number along the branch. */
+	/** Lore revision number along the branch. */
 	int32 RevisionNumber = 0;
 
 	/** Commit message. */
@@ -64,6 +65,9 @@ public:
 
 	/** Lore binary, used to run extract command. */
 	FString PathToLoreBinary;
+
+	/** Backend this revision extracts through. */
+	ELoreBackendMode BackendMode = ELoreBackendMode::Native;
 };
 
 typedef TSharedRef<FLoreSourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlRevisionRef;

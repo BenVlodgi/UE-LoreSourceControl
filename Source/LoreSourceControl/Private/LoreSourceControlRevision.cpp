@@ -11,7 +11,7 @@ bool FLoreSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type 
 bool FLoreSourceControlRevision::Get(FString& InOutFilename) const
 #endif
 {
-	// An empty name means choose our own output path.
+	// Empty name means choose our own output path.
 	if (InOutFilename.IsEmpty())
 	{
 		// The temporary file must sit under Saved/Diff, which is mounted as the /Temp/ package root, so the editor can load it for diff. A path outside a mounted root yields an empty package name and the diff fails.
@@ -30,14 +30,8 @@ bool FLoreSourceControlRevision::Get(FString& InOutFilename) const
 	}
 
 	const FString RelativeFile = LoreSourceControlUtils::RelativeFilename(Filename, PathToRepositoryRoot);
-	TArray<FString> Results;
 	TArray<FString> Errors;
-	TArray<FString> Parameters;
-	Parameters.Add(FString::Printf(TEXT("--revision %s"), *CommitId));
-	Parameters.Add(FString::Printf(TEXT("--path \"%s\""), *RelativeFile));
-	Parameters.Add(FString::Printf(TEXT("--output \"%s\""), *InOutFilename));
-
-	const bool bWritten = LoreSourceControlUtils::RunCommand(TEXT("file write"), PathToLoreBinary, PathToRepositoryRoot, Parameters, TArray<FString>(), Results, Errors)
+	const bool bWritten = LoreSourceControlUtils::WriteRevisionFile(BackendMode, PathToLoreBinary, PathToRepositoryRoot, RelativeFile, CommitId, InOutFilename, Errors)
 		&& IFileManager::Get().FileExists(*InOutFilename);
 	if (!bWritten)
 	{
