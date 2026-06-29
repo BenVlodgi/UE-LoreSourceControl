@@ -3,6 +3,7 @@
 #include "LoreSourceControlCommand.h"
 #include "LoreSourceControlModule.h"
 #include "LoreSourceControlProvider.h"
+#include "LoreSourceControlLog.h"
 
 FLoreSourceControlCommand::FLoreSourceControlCommand(const FSourceControlOperationRef& InOperation, const FLoreSourceControlWorkerRef& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate)
 	: Operation(InOperation)
@@ -24,6 +25,7 @@ FLoreSourceControlCommand::FLoreSourceControlCommand(const FSourceControlOperati
 	bUsingLocking = Module.GetSettings().IsUsingLocking();
 	bPushAfterCommit = Module.GetSettings().IsPushAfterCommit();
 	BackendMode = Module.GetSettings().GetBackendMode();
+	bRemoteAvailable = Provider.IsRemoteAvailable();
 }
 
 bool FLoreSourceControlCommand::DoWork()
@@ -71,6 +73,17 @@ ECommandResult::Type FLoreSourceControlCommand::ReturnResults()
 	{
 		Result = ECommandResult::Cancelled;
 	}
+
+	// One outcome line per operation so the log shows what ran; failures carry their reasons, since the editor only surfaces a generic dialog.
+	if (Result == ECommandResult::Failed)
+	{
+		UE_LOG(LogLoreSourceControl, Warning, TEXT("%s failed: %s"), *Operation->GetName().ToString(), *FString::Join(ErrorMessages, TEXT(" | ")));
+	}
+	else
+	{
+		UE_LOG(LogLoreSourceControl, Log, TEXT("%s %s"), *Operation->GetName().ToString(), Result == ECommandResult::Cancelled ? TEXT("cancelled") : TEXT("succeeded"));
+	}
+
 	OperationCompleteDelegate.ExecuteIfBound(Operation, Result);
 	return Result;
 }

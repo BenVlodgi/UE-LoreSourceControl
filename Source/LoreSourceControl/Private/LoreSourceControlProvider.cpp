@@ -562,6 +562,12 @@ TSharedRef<SWidget> FLoreSourceControlProvider::MakeSettingsWidget() const
 	+ SVerticalBox::Slot().AutoHeight().Padding(2.0f)
 	[
 		SNew(SHorizontalBox)
+		// Token sign-in applies only when the server is reachable and wants an auth the client lacks; hidden for an unreachable server or one with auth off.
+		.Visibility_Lambda([]()
+		{
+			const FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+			return (Provider.IsRemoteAvailable() && !Provider.IsRemoteAuthorized()) ? EVisibility::Visible : EVisibility::Collapsed;
+		})
 		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
 		[
 			SNew(STextBlock).MinDesiredWidth(70.0f).Text(LOCTEXT("TokenLabel", "Token"))

@@ -2,8 +2,16 @@
 
 #include "LoreSourceControlRevision.h"
 #include "LoreSourceControlUtils.h"
+#include "LoreSourceControlLog.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+
+#if SOURCE_CONTROL_WITH_SLATE
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
+#endif
+
+#define LOCTEXT_NAMESPACE "LoreSourceControl"
 
 #if LORE_UE5_0_OR_LATER
 bool FLoreSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type InConcurrency) const
@@ -11,6 +19,12 @@ bool FLoreSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type 
 bool FLoreSourceControlRevision::Get(FString& InOutFilename) const
 #endif
 {
+	// A revision cannot be extracted without its id. liblore's file write treats an empty revision as "write the working tree", which would silently diff an asset against itself, so refuse rather than extract the wrong content.
+	if (CommitId.IsEmpty())
+	{
+		return false;
+	}
+
 	// Empty name means choose our own output path.
 	if (InOutFilename.IsEmpty())
 	{
@@ -35,6 +49,19 @@ bool FLoreSourceControlRevision::Get(FString& InOutFilename) const
 		&& IFileManager::Get().FileExists(*InOutFilename);
 	if (!bWritten)
 	{
+		// A failed extraction surfaces in the editor only as a generic "content unsupported" dialog, so name the revision and the likely cause: after a push the bytes live only on the remote, so extraction needs the content present locally or a reachable server.
+		UE_LOG(LogLoreSourceControl, Warning, TEXT("Could not extract revision %s of %s for diff. Its content is not in the local store and could not be fetched from the server. %s"), *CommitId, *Filename, *FString::Join(Errors, TEXT(" | ")));
+#if SOURCE_CONTROL_WITH_SLATE
+		// Toast names the asset and cause, since the engine's own diff dialog is generic. The notification manager touches Slate, so only on the game thread; the EConcurrency overload can run elsewhere and there the log above is the only record.
+		if (IsInGameThread())
+		{
+			FNotificationInfo Info(FText::Format(
+				LOCTEXT("RevisionExtractFailed", "Could not load {0} for diff. This revision's content is not available in the local store or on a reachable Lore server."),
+				FText::FromString(FPaths::GetCleanFilename(Filename))));
+			Info.ExpireDuration = 6.0f;
+			FSlateNotificationManager::Get().AddNotification(Info);
+		}
+#endif
 		// Drop a partial output so a later diff cannot reuse a bad file.
 		IFileManager::Get().Delete(*InOutFilename, false, true);
 	}
@@ -74,3 +101,5 @@ TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> FLoreSourceControlRevisi
 const FDateTime& FLoreSourceControlRevision::GetDate() const { return Date; }
 int32 FLoreSourceControlRevision::GetCheckInIdentifier() const { return RevisionNumber; }
 int32 FLoreSourceControlRevision::GetFileSize() const { return FileSize; }
+
+#undef LOCTEXT_NAMESPACE

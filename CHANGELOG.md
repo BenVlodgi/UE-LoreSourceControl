@@ -2,6 +2,23 @@
 
 Notable changes to LoreSourceControl, the Unreal Editor Revision Control provider for Lore.
 
+## 0.3.1
+
+Fix a submit that left a file checked out and the save failure it caused on the next edit, fix a diff that compared an asset against itself, log every operation's outcome, and add automated coverage for every operation.
+
+### Fixed
+- Submit releases the lock on the committed files. Against a server with authentication off the released lock read back as still held, so the file stayed checked out and read-only and the next edit failed to save. Submit now asserts the released state the way revert does.
+- Diff against depot extracts the server revision instead of silently extracting the working copy, so an asset no longer diffs against itself.
+- The settings panel hides the token sign-in row when the server is unreachable or has authentication off, where pasting a token does nothing.
+
+### Changed
+- Every operation logs its outcome under `LogLoreSourceControl`, with the reasons on failure, so a problem is visible in the log rather than only as a generic editor dialog. A revision extraction that fails for diff names the revision and points at server reachability, the case behind a historical diff reporting unsupported content.
+- File history marks a revision whose content has left the local store with an `[Unavailable]` prefix, and a diff of such a revision raises a notification naming the asset and the cause instead of the engine's generic "content unsupported" dialog. A revision is marked only on a definitive not-local answer from the native store probe, so freshly committed local content never reads as unavailable.
+
+### Testing
+- The in-plugin automation suite covers every operation and the four reported regressions (submit releases the lock and leaves the file writable, re-edit then resubmit succeeds, diff against depot yields the server revision, historical revision extraction is loadable), run unattended against the managed local server.
+- The local-store content probe is covered directly: a present address reads as local, a bogus address reads as absent, history captures each revision's content address, and an obliterated revision reads as unavailable and refuses extraction.
+
 ## 0.3
 
 Drive the editor's source control operations through one client with a selectable backend, native by default on Windows, add sign-in from the settings panel, and make the plugin's text translatable.

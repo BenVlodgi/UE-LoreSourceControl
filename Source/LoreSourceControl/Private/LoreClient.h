@@ -47,6 +47,7 @@ namespace LoreClient
 		FDateTime Date = FDateTime::MinValue();
 		FString Description;
 		FString UserName;
+		FString Address;        // content address ("hash-context" hex), for a local-store probe
 	};
 
 	// Identity resolved from an auth operation, from a LORE_EVENT_AUTH_USER_INFO event.
@@ -67,6 +68,9 @@ namespace LoreClient
 	bool GetLockStatus(const FString& InRepositoryRoot, const TArray<FString>& InRelativePaths, TArray<FLockStatus>& OutLocks, FString& OutError);
 
 	bool GetHistory(const FString& InRepositoryRoot, const FString& InRelativeFile, TArray<FHistoryRevision>& OutRevisions, FString& OutError);
+
+	// Probe whether a revision's content is recoverable. With bQueryRemote it checks both the local store and the remote; pass false to answer from the local store alone when the remote is known unreachable, which avoids a connection-timeout stall. bOutAvailable is true when any queried store holds the exact address with its payload.
+	bool QueryContentAvailable(const FString& InRepositoryRoot, const FString& InAddress, bool& bOutAvailable, FString& OutError, bool bQueryRemote = true);
 
 	bool Stage(const FString& InRepositoryRoot, const TArray<FString>& InRelativePaths, FString& OutError);
 

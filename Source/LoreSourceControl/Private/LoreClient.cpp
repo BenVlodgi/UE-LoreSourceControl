@@ -65,6 +65,23 @@ namespace
 		return Out;
 	}
 
+	FString ContextToHex(const lore_context_t& InContext)
+	{
+		FString Out;
+		Out.Reserve(sizeof(InContext.data) * 2);
+		for (int32 Index = 0; Index < static_cast<int32>(sizeof(InContext.data)); ++Index)
+		{
+			Out.Appendf(TEXT("%02x"), InContext.data[Index]);
+		}
+		return Out;
+	}
+
+	// Canonical Lore content address: the hash hex, a hyphen, then the context hex.
+	FString AddressToString(const lore_address_t& InAddress)
+	{
+		return HashToHex(InAddress.hash) + TEXT("-") + ContextToHex(InAddress.context);
+	}
+
 	// OutStorage and OutViews must outlive the returned array, which holds only pointers into them.
 	lore_string_array_t BuildAbsolutePaths(const FString& InRoot, const TArray<FString>& InPaths, TArray<FLoreUtf8>& OutStorage, TArray<lore_string_t>& OutViews)
 	{
@@ -254,6 +271,61 @@ namespace
 		}
 	}
 
+	// One immutable-store query's result accumulates here. The library emits one query event per fragment; only the top-level fragment for the queried address matters, so the first event with the queried-back local result is kept.
+	struct FStoreQueryAccumulator
+	{
+		bool* Available = nullptr;  // set true when any store, local or remote, holds the exact address with its payload
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		TArray<FString> Diagnostics;
+	};
+
+	void StoreQueryEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FStoreQueryAccumulator* Accumulator = reinterpret_cast<FStoreQueryAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_REPOSITORY_STORE_IMMUTABLE_QUERY:
+			{
+				const lore_repository_store_immutable_query_event_data_t& Query = Event->repository_store_immutable_query;
+				// One event fires per store. A pushed fragment reads payload != 0 only on the remote, since the local store keeps the index but drops the bytes after a push. status 0 is the exact address. The content is recoverable if any store carries the payload.
+				if (Accumulator->Available && Query.status == 0 && Query.payload != 0)
+				{
+					*Accumulator->Available = true;
+				}
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				Accumulator->CompleteStatus = Event->complete.status;
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
 	// One synchronous file-history call's events accumulate here. FILE_HISTORY starts a revision; any following METADATA attaches to it.
 	struct FHistoryAccumulator
 	{
@@ -282,6 +354,7 @@ namespace
 				Out.RevisionNumber = static_cast<int32>(Entry.revision_number);
 				Out.Action = ActionToken(Entry.action);
 				Out.FileSize = static_cast<int32>(Entry.size);
+				Out.Address = AddressToString(Entry.address);
 				Accumulator->Revisions->Add(MoveTemp(Out));
 				break;
 			}
@@ -508,6 +581,42 @@ namespace LoreClient
 		{
 			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
 			OutError = FString::Printf(TEXT("lore_lock_file_status failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool QueryContentAvailable(const FString& InRepositoryRoot, const FString& InAddress, bool& bOutAvailable, FString& OutError, bool bQueryRemote)
+	{
+		bOutAvailable = false;
+
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Address(InAddress);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+		// A query against an unreachable server blocks on the connection timeout, so answer from the local store alone when the caller already knows the remote is down.
+		Globals.local = bQueryRemote ? 0 : 1;
+
+		lore_repository_store_immutable_query_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.address = Address.View();
+		Args.recurse = 0;
+
+		FStoreQueryAccumulator Accumulator;
+		Accumulator.Available = &bOutAvailable;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &StoreQueryEventCallback;
+
+		const int32 Code = lore_repository_store_immutable_query(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_repository_store_immutable_query failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			bOutAvailable = false;
 			return false;
 		}
 		return true;

@@ -42,6 +42,9 @@ public:
 	/** Hash truncated for display. */
 	FString ShortCommitId;
 
+	/** Content address ("hash-context" hex) of this revision's file, for a local-store probe. Empty on the command-line history path. */
+	FString ContentAddress;
+
 	/** Lore revision number along the branch. */
 	int32 RevisionNumber = 0;
 

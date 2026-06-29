@@ -53,6 +53,9 @@ public:
 	/** Which backend this command runs through */
 	ELoreBackendMode BackendMode = ELoreBackendMode::Native;
 
+	/** Remote reachability snapshotted at dispatch, so the worker thread never reads the provider. Lets the history content-availability probe skip a known-down remote. */
+	bool bRemoteAvailable = true;
+
 	FSourceControlOperationRef Operation;
 	FLoreSourceControlWorkerRef Worker;
 	FSourceControlOperationComplete OperationCompleteDelegate;

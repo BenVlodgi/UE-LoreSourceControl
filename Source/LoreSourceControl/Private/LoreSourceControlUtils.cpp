@@ -402,7 +402,7 @@ void ParseLocksFromClient(const TArray<LoreClient::FLockStatus>& InLocks, TMap<F
 	}
 }
 
-void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FHistoryRevision>& InRevisions, const FString& InAbsoluteFile, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TLoreSourceControlHistory& OutHistory)
+void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FHistoryRevision>& InRevisions, const FString& InAbsoluteFile, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TLoreSourceControlHistory& OutHistory, bool bRemoteReachable)
 {
 	for (const LoreClient::FHistoryRevision& In : InRevisions)
 	{
@@ -419,6 +419,19 @@ void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FH
 		Revision->UserName = In.UserName;
 		Revision->Date = In.Date;
 		Revision->FileSize = In.FileSize;
+		Revision->ContentAddress = In.Address;
+
+		// Mark a revision whose content is in neither the local store nor the reachable remote, since its diff cannot extract it. After a push the bytes live only on the remote, so the probe must consult it; with the remote down the probe is local-only and pushed content reads unavailable, which is exactly what an offline diff would find.
+		if (!In.Address.IsEmpty())
+		{
+			bool bAvailable = false;
+			FString ProbeError;
+			if (LoreClient::QueryContentAvailable(InRepositoryRoot, In.Address, bAvailable, ProbeError, bRemoteReachable) && !bAvailable)
+			{
+				Revision->Description = NSLOCTEXT("LoreSourceControl", "RevisionContentUnavailable", "[Unavailable] ").ToString() + Revision->Description;
+			}
+		}
+
 		OutHistory.Add(Revision);
 	}
 }
@@ -990,7 +1003,7 @@ FString LoreActionToString(const FString& InAction)
 	return Label ? Label->ToString() : InAction;
 }
 
-bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory)
+bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory, bool bRemoteReachable)
 {
 	const FString RelativeFile = RelativeFilename(InFile, InRepositoryRoot);
 
@@ -1001,7 +1014,7 @@ bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, c
 		FString ClientError;
 		if (LoreClient::GetHistory(InRepositoryRoot, RelativeFile, ClientRevisions, ClientError))
 		{
-			BuildHistoryFromClient(InMode, ClientRevisions, FPaths::ConvertRelativePathToFull(InFile), InPathToLoreBinary, InRepositoryRoot, OutHistory);
+			BuildHistoryFromClient(InMode, ClientRevisions, FPaths::ConvertRelativePathToFull(InFile), InPathToLoreBinary, InRepositoryRoot, OutHistory, bRemoteReachable);
 			return true;
 		}
 		if (!FallsBackToCommandLine(InMode))

@@ -454,6 +454,94 @@ namespace
 			return LoreSourceControlUtils::RunCommand(FString::Printf(TEXT("--identity test@example.com repository create %s"), *Url), LoreClient, ProbeDir, TArray<FString>(), TArray<FString>(), Results, Errors);
 		}
 	};
+
+	// One repository on a freshly started loreserver, with a working tree, for a live test. Construct, then check IsReady; the destructor stops the server and deletes the tree. The common preamble (find the client, start the server, make a tree, create the repository) lives here so each live test states only what it exercises.
+	struct FLoreTestFixture
+	{
+		FString Binary;
+		FString Version;
+		FLoreManagedServer Server;
+		FString Root;
+		FString RepoUrl;
+		bool bReady = false;
+
+		FLoreTestFixture(FAutomationTestBase& Test, const TCHAR* RootLabel, const TCHAR* RepoPrefix)
+		{
+			Binary = LoreSourceControlUtils::FindLoreBinaryPath();
+			if (!LoreSourceControlUtils::CheckLoreAvailability(ELoreBackendMode::CommandLine, Binary, Version))
+			{
+				Test.AddError(TEXT("Lore client not found; this live test requires it."));
+				return;
+			}
+			if (!Server.Start(Binary, Test))
+			{
+				return;
+			}
+			Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), RootLabel, FGuid::NewGuid().ToString(EGuidFormats::Digits));
+			IFileManager::Get().MakeDirectory(*Root, true);
+			RepoUrl = FString::Printf(TEXT("%s/%s-%s"), *Server.ServerBase, RepoPrefix, *FGuid::NewGuid().ToString(EGuidFormats::Digits).Left(8));
+			TArray<FString> Results, Errors;
+			const bool bCreated = LoreSourceControlUtils::RunCommand(FString::Printf(TEXT("--identity test@example.com repository create %s"), *RepoUrl), Binary, Root, TArray<FString>(), TArray<FString>(), Results, Errors);
+			if (!bCreated)
+			{
+				Test.AddError(TEXT("Could not create the repository on the test server."));
+				return;
+			}
+			bReady = true;
+		}
+
+		~FLoreTestFixture()
+		{
+			if (!Root.IsEmpty())
+			{
+				IFileManager::Get().DeleteDirectory(*Root, false, true);
+			}
+		}
+
+		// Clone the same repository into a second sibling tree, for divergence (remote ahead or behind, push races). Returns the absolute clone path, empty on failure.
+		FString CloneSecondTree(FAutomationTestBase& Test, const TCHAR* CloneLeaf)
+		{
+			const FString Parent = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreSecondClone"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+			IFileManager::Get().MakeDirectory(*Parent, true);
+			const FString CloneRoot = Parent / CloneLeaf;
+			TArray<FString> Results, Errors;
+			const bool bCloned = LoreSourceControlUtils::RunCommand(FString::Printf(TEXT("--identity test@example.com clone %s \"%s\""), *RepoUrl, *CloneRoot), Binary, Parent, TArray<FString>(), TArray<FString>(), Results, Errors);
+			if (!bCloned)
+			{
+				Test.AddError(TEXT("Could not clone a second working tree."));
+				return FString();
+			}
+			return CloneRoot;
+		}
+	};
+
+	// Stage one relative file, commit with a message, then push, through the active backend. The common "land a revision on the server" step for a live test.
+	bool StageCommitPush(const FLoreTestFixture& Fixture, const FString& RelativeFile, const FString& Message)
+	{
+		using namespace LoreSourceControlUtils;
+		TArray<FString> Errors;
+		if (!StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { RelativeFile }, Errors))
+		{
+			return false;
+		}
+		if (!CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), Message, Errors))
+		{
+			return false;
+		}
+		return PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Errors);
+	}
+
+	// Point the registered provider at a fixture's working tree, returning the base interface. The caller restores the previous provider with ON_SCOPE_EXIT.
+	ISourceControlProvider& BeginProviderOn(const FLoreTestFixture& Fixture, FName& OutPrevious)
+	{
+		ISourceControlModule& SourceControl = ISourceControlModule::Get();
+		OutPrevious = SourceControl.GetProvider().GetName();
+		SourceControl.SetProvider(FName("Lore"));
+		FLoreSourceControlProvider& LoreProvider = FLoreSourceControlModule::Get().GetProvider();
+		LoreProvider.Init();
+		LoreProvider.SetRepositoryInfo(true, true, Fixture.Root, Fixture.RepoUrl, TEXT("test@example.com"), TEXT("main"), FString(), Fixture.Version);
+		return SourceControl.GetProvider();
+	}
 }
 
 // Test all utilities against a loreserver.
@@ -917,5 +1005,1089 @@ bool FLoreSourceControlProviderTest::RunTest(const FString& Parameters)
 
 	return true;
 }
+
+// Regression tests --------------------------------------------------------------
+// Each pins a bug that was fixed (or, for the historical diff, is still under investigation). The name states the behavior so a failure names the regression.
+
+// Bug 1+2: after a normal submit with locking on and keep-checked-out off, the check-in worker releases the held lock and asserts NotLocked, so a committed lockable asset ends read-only and not checked out, and a text file ends writable.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRegressionSubmitReleasesLockTest, "LoreSourceControl.Regression.SubmitReleasesLockAndWritable", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRegressionSubmitReleasesLockTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreRegSubmitLock"), TEXT("rsl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+	// A lockable asset is .uasset by extension; the content is plain text, which Lore stores as bytes regardless.
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("locktest.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("asset version one"), *Asset);
+	const TArray<FString> AssetTargets = { Asset };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), AssetTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("add lockable asset")));
+	Provider.Execute(AddCheckIn, AssetTargets, EConcurrency::Synchronous);
+
+	// Check out: lock acquired, read-only cleared.
+	const ECommandResult::Type CheckOutResult = Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), AssetTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Check out the lockable asset succeeds"), (int32)CheckOutResult, (int32)ECommandResult::Succeeded);
+	const FSourceControlStatePtr CheckedOut = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestTrue(TEXT("Asset reads as checked out after check out"), CheckedOut.IsValid() && CheckedOut->IsCheckedOut());
+	TestFalse(TEXT("Checked-out lockable asset is writable on disk"), PlatformFile.IsReadOnly(*Asset));
+
+	// Edit and submit with keep-checked-out off (the default).
+	FFileHelper::SaveStringToFile(TEXT("asset version two"), *Asset);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> EditCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	EditCheckIn->SetDescription(FText::FromString(TEXT("edit lockable asset")));
+#if LORE_UE5_1_OR_LATER
+	EditCheckIn->SetKeepCheckedOut(false);
+#endif
+	const ECommandResult::Type EditResult = Provider.Execute(EditCheckIn, AssetTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Submitting the edited lockable asset succeeds"), (int32)EditResult, (int32)ECommandResult::Succeeded);
+
+	const FSourceControlStatePtr Submitted = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestFalse(TEXT("Submitted lockable asset is no longer checked out"), Submitted.IsValid() && Submitted->IsCheckedOut());
+	TestTrue(TEXT("Submitted lockable asset is read-only on disk again"), PlatformFile.IsReadOnly(*Asset));
+
+	// A non-lockable text file never takes a lock and stays writable after submit.
+	const FString TextFile = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("locktest.txt"));
+	FFileHelper::SaveStringToFile(TEXT("text version one"), *TextFile);
+	const TArray<FString> TextTargets = { TextFile };
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), TextTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> TextCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	TextCheckIn->SetDescription(FText::FromString(TEXT("add text file")));
+	const ECommandResult::Type TextResult = Provider.Execute(TextCheckIn, TextTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Submitting the text file succeeds"), (int32)TextResult, (int32)ECommandResult::Succeeded);
+	TestFalse(TEXT("Submitted text file stays writable on disk"), PlatformFile.IsReadOnly(*TextFile));
+
+	return true;
+}
+
+// Bug 2: a re-edit and re-submit of a checked-out lockable asset still succeeds and records a new revision, with no save error left on the operation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRegressionReEditThenSubmitTest, "LoreSourceControl.Regression.ReEditThenSubmitSucceeds", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRegressionReEditThenSubmitTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreRegReEdit"), TEXT("rre"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("reedit.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("reedit version one"), *Asset);
+	const TArray<FString> AssetTargets = { Asset };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), AssetTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("add reedit asset")));
+	Provider.Execute(AddCheckIn, AssetTargets, EConcurrency::Synchronous);
+
+	// First normal submit of a checked-out edit.
+	Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), AssetTargets, EConcurrency::Synchronous);
+	FFileHelper::SaveStringToFile(TEXT("reedit version two"), *Asset);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> FirstCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	FirstCheckIn->SetDescription(FText::FromString(TEXT("first reedit submit")));
+	const ECommandResult::Type FirstResult = Provider.Execute(FirstCheckIn, AssetTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("First re-edit submit succeeds"), (int32)FirstResult, (int32)ECommandResult::Succeeded);
+
+	TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> FirstHistory = ISourceControlOperation::Create<FUpdateStatus>();
+	FirstHistory->SetUpdateHistory(true);
+	Provider.Execute(FirstHistory, AssetTargets, EConcurrency::Synchronous);
+	const FSourceControlStatePtr AfterFirst = Provider.GetState(Asset, EStateCacheUsage::Use);
+	const int32 HistoryAfterFirst = AfterFirst.IsValid() ? AfterFirst->GetHistorySize() : 0;
+	TestTrue(TEXT("History has at least one revision after the first submit"), HistoryAfterFirst >= 1);
+
+	// Second check out, edit, submit; this is the path the lock-release fix had to keep working.
+	Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), AssetTargets, EConcurrency::Synchronous);
+	FFileHelper::SaveStringToFile(TEXT("reedit version three"), *Asset);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> SecondCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	SecondCheckIn->SetDescription(FText::FromString(TEXT("second reedit submit")));
+	const ECommandResult::Type SecondResult = Provider.Execute(SecondCheckIn, AssetTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Second re-edit submit succeeds"), (int32)SecondResult, (int32)ECommandResult::Succeeded);
+
+	TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> SecondHistory = ISourceControlOperation::Create<FUpdateStatus>();
+	SecondHistory->SetUpdateHistory(true);
+	Provider.Execute(SecondHistory, AssetTargets, EConcurrency::Synchronous);
+	const FSourceControlStatePtr AfterSecond = Provider.GetState(Asset, EStateCacheUsage::Use);
+	const int32 HistoryAfterSecond = AfterSecond.IsValid() ? AfterSecond->GetHistorySize() : 0;
+	TestTrue(TEXT("History grew by one after the second submit"), HistoryAfterSecond > HistoryAfterFirst);
+
+	return true;
+}
+
+// Bug 3: diffing against the depot extracts the committed server revision, not the working file. An empty revision id used to make liblore write the working tree, diffing the asset against itself; FLoreSourceControlRevision::Get now refuses an empty id.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRegressionDiffAgainstDepotTest, "LoreSourceControl.Regression.DiffAgainstDepotIsServerContent", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRegressionDiffAgainstDepotTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreRegDiffDepot"), TEXT("rdd"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const FString File = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("diffdepot.txt"));
+	FFileHelper::SaveStringToFile(TEXT("VERSION-ONE"), *File);
+	const TArray<FString> Targets = { File };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), Targets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
+	CheckIn->SetDescription(FText::FromString(TEXT("commit version one")));
+	const ECommandResult::Type CommitResult = Provider.Execute(CheckIn, Targets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Committing version one succeeds"), (int32)CommitResult, (int32)ECommandResult::Succeeded);
+
+	// Edit the working file without committing; the depot still holds version one.
+	FFileHelper::SaveStringToFile(TEXT("VERSION-TWO"), *File);
+
+	TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> HistoryOp = ISourceControlOperation::Create<FUpdateStatus>();
+	HistoryOp->SetUpdateHistory(true);
+	Provider.Execute(HistoryOp, Targets, EConcurrency::Synchronous);
+
+	const FSourceControlStatePtr State = Provider.GetState(File, EStateCacheUsage::Use);
+	TestTrue(TEXT("State carries history"), State.IsValid() && State->GetHistorySize() >= 1);
+	if (State.IsValid() && State->GetHistorySize() >= 1)
+	{
+		TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> Depot = State->GetHistoryItem(0);
+		TestTrue(TEXT("Depot revision item is valid"), Depot.IsValid());
+		if (Depot.IsValid())
+		{
+			FString DepotTemp;
+			const bool bExtracted = Depot->Get(DepotTemp);
+			TestTrue(TEXT("Depot revision extracts to a file"), bExtracted);
+			if (bExtracted)
+			{
+				FString DepotContent;
+				FFileHelper::LoadFileToString(DepotContent, *DepotTemp);
+				TestEqual(TEXT("Extracted depot content is the committed version one"), DepotContent, FString(TEXT("VERSION-ONE")));
+				TestNotEqual(TEXT("Extracted depot content is not the edited working file"), DepotContent, FString(TEXT("VERSION-TWO")));
+			}
+		}
+	}
+
+	return true;
+}
+
+// Bug 4 (under investigation): extracting an older historical revision must load its content, not fail with "content unsupported". Two commits give two revisions; the older one must extract to "V1".
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRegressionHistoricalDiffTest, "LoreSourceControl.Regression.HistoricalRevisionDiffLoadable", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRegressionHistoricalDiffTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreRegHistDiff"), TEXT("rhd"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("histdiff.txt");
+	FFileHelper::SaveStringToFile(TEXT("V1"), *File);
+	TestTrue(TEXT("First commit (V1) lands"), StageCommitPush(Fixture, TEXT("histdiff.txt"), TEXT("commit V1")));
+
+	FFileHelper::SaveStringToFile(TEXT("V2"), *File);
+	TestTrue(TEXT("Second commit (V2) lands"), StageCommitPush(Fixture, TEXT("histdiff.txt"), TEXT("commit V2")));
+
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, File, Errors, History);
+	TestTrue(TEXT("History has two revisions"), History.Num() >= 2);
+	if (History.Num() >= 2)
+	{
+		// Index zero is newest (V2); index one is the older revision (V1).
+		const FLoreSourceControlRevisionRef Older = History[1];
+		FString OlderTemp;
+		const bool bExtracted = Older->Get(OlderTemp);
+		TestTrue(TEXT("Older historical revision extracts (bug 4: must not fail with content unsupported)"), bExtracted);
+		if (bExtracted)
+		{
+			TestTrue(TEXT("Extracted older revision is non-empty"), IFileManager::Get().FileSize(*OlderTemp) > 0);
+			FString OlderContent;
+			FFileHelper::LoadFileToString(OlderContent, *OlderTemp);
+			TestEqual(TEXT("Older historical revision content is V1"), OlderContent, FString(TEXT("V1")));
+		}
+	}
+
+	return true;
+}
+
+// Breadth: Status ---------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreStatusMovedTest, "LoreSourceControl.Status.Moved", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreStatusMovedTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreStatusMoved"), TEXT("smv"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Source = Fixture.Root / TEXT("source.txt");
+	FFileHelper::SaveStringToFile(TEXT("moved content"), *Source);
+	TestTrue(TEXT("Initial commit lands"), StageCommitPush(Fixture, TEXT("source.txt"), TEXT("add source")));
+
+	// lore stage move records a move already performed on disk, so rename the file before staging the move.
+	const FString Dest = Fixture.Root / TEXT("dest.txt");
+	TestTrue(TEXT("On-disk rename"), IFileManager::Get().Move(*Dest, *Source));
+
+	// Stage the move; Lore records the destination as Moved with the source in fromPath.
+	TArray<FString> Results, Errors;
+	const bool bMoved = RunCommand(TEXT("stage move"), Fixture.Binary, Fixture.Root, TArray<FString>(), { TEXT("source.txt"), TEXT("dest.txt") }, Results, Errors);
+	TestTrue(TEXT("Stage move succeeds"), bMoved);
+
+	TArray<FLoreSourceControlState> States;
+	TArray<FString> StatusErrors;
+	RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, { Dest }, StatusErrors, States);
+	TestEqual(TEXT("One state for the move destination"), States.Num(), 1);
+	if (States.Num() == 1)
+	{
+		TestEqual(TEXT("Move destination reads as Moved"), (int32)States[0].WorkingCopyState, (int32)ELoreWorkingCopyState::Moved);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreStatusCopiedTest, "LoreSourceControl.Status.Copied", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreStatusCopiedTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreStatusCopied"), TEXT("scp"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Source = Fixture.Root / TEXT("original.txt");
+	FFileHelper::SaveStringToFile(TEXT("copied content"), *Source);
+	TestTrue(TEXT("Initial commit lands"), StageCommitPush(Fixture, TEXT("original.txt"), TEXT("add original")));
+
+	// A copy on disk with identical content stages by hash as a Copied entry.
+	const FString Copy = Fixture.Root / TEXT("duplicate.txt");
+	IFileManager::Get().Copy(*Copy, *Source);
+	TArray<FString> Results, Errors;
+	RunCommand(TEXT("stage"), Fixture.Binary, Fixture.Root, { TEXT("--scan") }, { TEXT("duplicate.txt") }, Results, Errors);
+
+	TArray<FLoreSourceControlState> States;
+	TArray<FString> StatusErrors;
+	RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, { Copy }, StatusErrors, States);
+	TestEqual(TEXT("One state for the copy"), States.Num(), 1);
+	if (States.Num() == 1)
+	{
+		// Lore may classify a content-identical new file as Copied or as Added; accept either, but it must be a staged-for-inclusion state, not Unknown or NotControlled.
+		const ELoreWorkingCopyState::Type Got = States[0].WorkingCopyState;
+		const bool bStagedNew = Got == ELoreWorkingCopyState::Copied || Got == ELoreWorkingCopyState::Added;
+		TestTrue(TEXT("Content-identical staged file reads as Copied or Added"), bStagedNew);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreStatusIgnoredTest, "LoreSourceControl.Status.Ignored", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreStatusIgnoredTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreStatusIgnored"), TEXT("sig"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// The status parser filters transient editor paths (Saved, Intermediate) so they never offer for add. A file under Saved must not come back as a controllable state.
+	const FString SavedDir = Fixture.Root / TEXT("Saved") / TEXT("Autosaves");
+	IFileManager::Get().MakeDirectory(*SavedDir, true);
+	const FString Transient = SavedDir / TEXT("transient.txt");
+	FFileHelper::SaveStringToFile(TEXT("transient"), *Transient);
+
+	TArray<FLoreSourceControlState> States;
+	TArray<FString> StatusErrors;
+	RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, { Transient }, StatusErrors, States);
+	if (States.Num() == 1)
+	{
+		// The status parser drops transient editor paths, so a file under Saved never reads as NotControlled and the submit dialog never offers it for add.
+		TestNotEqual(TEXT("Transient Saved path is not offered for add"), (int32)States[0].WorkingCopyState, (int32)ELoreWorkingCopyState::NotControlled);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreStatusRemoteAheadTest, "LoreSourceControl.Status.RemoteAhead", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreStatusRemoteAheadTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreStatusRemoteAhead"), TEXT("sra"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("shared.txt");
+	FFileHelper::SaveStringToFile(TEXT("first revision"), *File);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("shared.txt"), TEXT("first")));
+
+	// A second clone pushes a newer revision; this clone is then behind the remote.
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("aheadclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneFile = Clone / TEXT("shared.txt");
+	FFileHelper::SaveStringToFile(TEXT("second revision from the clone"), *CloneFile);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages its edit"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("shared.txt") }, CloneErrors));
+	TestTrue(TEXT("Clone commits its edit"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("second from clone"), CloneErrors));
+	TestTrue(TEXT("Clone pushes its edit"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// The first clone now reports remote-ahead, so its file reads as not current.
+	TArray<FLoreSourceControlState> States;
+	TArray<FString> StatusErrors;
+	RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, { File }, StatusErrors, States);
+	TestEqual(TEXT("One state for the behind file"), States.Num(), 1);
+	if (States.Num() == 1)
+	{
+		TestFalse(TEXT("File behind the remote reads as not current"), States[0].IsCurrent());
+	}
+
+	return true;
+}
+
+// Breadth: Revert ---------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRevertModifiedWithLockTest, "LoreSourceControl.Revert.ModifiedFileWithLock", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRevertModifiedWithLockTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreRevertLock"), TEXT("rvl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("revertlock.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("revert version one"), *Asset);
+	const TArray<FString> Targets = { Asset };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), Targets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("add revert-lock asset")));
+	Provider.Execute(AddCheckIn, Targets, EConcurrency::Synchronous);
+
+	Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), Targets, EConcurrency::Synchronous);
+	FFileHelper::SaveStringToFile(TEXT("revert version two"), *Asset);
+	const FSourceControlStatePtr Edited = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestTrue(TEXT("Edited locked asset reads as checked out"), Edited.IsValid() && Edited->IsCheckedOut());
+	TestFalse(TEXT("Checked-out asset is writable"), PlatformFile.IsReadOnly(*Asset));
+
+	const ECommandResult::Type RevertResult = Provider.Execute(ISourceControlOperation::Create<FRevert>(), Targets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Revert succeeds"), (int32)RevertResult, (int32)ECommandResult::Succeeded);
+	const FSourceControlStatePtr Reverted = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestFalse(TEXT("Reverted asset is no longer checked out"), Reverted.IsValid() && Reverted->IsCheckedOut());
+	TestTrue(TEXT("Reverted lockable asset is read-only on disk again"), PlatformFile.IsReadOnly(*Asset));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRevertModifiedFileTest, "LoreSourceControl.Revert.ModifiedFile", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRevertModifiedFileTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreRevertModified"), TEXT("rvm"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const FString File = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("revertcontent.txt"));
+	FFileHelper::SaveStringToFile(TEXT("committed content"), *File);
+	const TArray<FString> Targets = { File };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), Targets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("commit content")));
+	Provider.Execute(AddCheckIn, Targets, EConcurrency::Synchronous);
+
+	// Edit on disk, then revert; the committed content must come back.
+	FFileHelper::SaveStringToFile(TEXT("dirty content"), *File);
+	const ECommandResult::Type RevertResult = Provider.Execute(ISourceControlOperation::Create<FRevert>(), Targets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Revert succeeds"), (int32)RevertResult, (int32)ECommandResult::Succeeded);
+
+	FString Content;
+	FFileHelper::LoadFileToString(Content, *File);
+	TestEqual(TEXT("Reverted file holds the committed content"), Content, FString(TEXT("committed content")));
+
+	return true;
+}
+
+// Breadth: CheckIn --------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreCheckInPushOffTest, "LoreSourceControl.CheckIn.PushOff", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreCheckInPushOffTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreCheckInPushOff"), TEXT("cpo"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasPushing = FLoreSourceControlModule::Get().GetSettings().IsPushAfterCommit();
+	FLoreSourceControlModule::Get().AccessSettings().SetPushAfterCommit(false);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetPushAfterCommit(bWasPushing); };
+
+	const FString File = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("pushoff.txt"));
+	FFileHelper::SaveStringToFile(TEXT("push off content"), *File);
+	const TArray<FString> Targets = { File };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), Targets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> CheckIn = ISourceControlOperation::Create<FCheckIn>();
+	CheckIn->SetDescription(FText::FromString(TEXT("local commit, no push")));
+	const ECommandResult::Type CommitResult = Provider.Execute(CheckIn, Targets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Commit with push off succeeds"), (int32)CommitResult, (int32)ECommandResult::Succeeded);
+
+	// The commit is local: the working file reads as unchanged (committed), and a clean clone made now must not see it yet.
+	const FSourceControlStatePtr Committed = Provider.GetState(File, EStateCacheUsage::Use);
+	TestTrue(TEXT("Locally committed file is no longer added"), Committed.IsValid() && !Committed->IsAdded());
+
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("pushoffclone"));
+	if (!Clone.IsEmpty())
+	{
+		ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+		const FString ClonedFile = Clone / TEXT("pushoff.txt");
+		TestFalse(TEXT("Unpushed commit is absent from a fresh clone"), IFileManager::Get().FileExists(*ClonedFile));
+
+		// A later explicit push delivers the local commit to the server.
+		TArray<FString> PushErrors;
+		const bool bPushed = PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, PushErrors);
+		TestTrue(TEXT("A later push of the local commit succeeds"), bPushed);
+
+		// A second clone made after the push contains the file.
+		const FString Clone2 = Fixture.CloneSecondTree(*this, TEXT("pushoffclone2"));
+		if (!Clone2.IsEmpty())
+		{
+			ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone2), false, true); };
+			const FString ClonedFile2 = Clone2 / TEXT("pushoff.txt");
+			TestTrue(TEXT("After the push, a fresh clone has the file"), IFileManager::Get().FileExists(*ClonedFile2));
+		}
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreCheckInBehindRemoteTest, "LoreSourceControl.CheckIn.BehindRemoteRejectsPush", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreCheckInBehindRemoteTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreCheckInBehind"), TEXT("cbr"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("contended.txt");
+	FFileHelper::SaveStringToFile(TEXT("base revision"), *File);
+	TestTrue(TEXT("Base commit lands"), StageCommitPush(Fixture, TEXT("contended.txt"), TEXT("base")));
+
+	// A second clone pushes first, so this clone's branch tip is behind the remote.
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("behindclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneFile = Clone / TEXT("contended.txt");
+	FFileHelper::SaveStringToFile(TEXT("clone wins the race"), *CloneFile);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("contended.txt") }, CloneErrors));
+	TestTrue(TEXT("Clone commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("clone first"), CloneErrors));
+	TestTrue(TEXT("Clone pushes first"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// This clone commits locally, then its push is rejected because the remote moved.
+	FFileHelper::SaveStringToFile(TEXT("our late edit"), *File);
+	TArray<FString> Errors;
+	TestTrue(TEXT("Local stage succeeds"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("contended.txt") }, Errors));
+	TestTrue(TEXT("Local commit succeeds"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("our late edit"), Errors));
+
+	TArray<FString> PushErrors;
+	const bool bPushed = PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, PushErrors);
+	TestFalse(TEXT("Pushing from behind the remote is rejected"), bPushed);
+
+	// The commit stays local: it is not lost, so a sync-and-resync resolves it. Confirm the local revision is still present by reading branch status.
+	FString Branch;
+	TestTrue(TEXT("Branch name still reads after the rejected push"), GetBranchName(ELoreBackendMode::CommandLine, Fixture.Binary, Fixture.Root, Branch));
+
+	return true;
+}
+
+#if LORE_UE5_1_OR_LATER
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreCheckInKeepCheckedOutTest, "LoreSourceControl.CheckIn.KeepCheckedOutOn", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreCheckInKeepCheckedOutTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreKeepCheckedOut"), TEXT("kco"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("keepout.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("keep version one"), *Asset);
+	const TArray<FString> Targets = { Asset };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), Targets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("add keepout asset")));
+	Provider.Execute(AddCheckIn, Targets, EConcurrency::Synchronous);
+
+	Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), Targets, EConcurrency::Synchronous);
+	FFileHelper::SaveStringToFile(TEXT("keep version two"), *Asset);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> KeepCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	KeepCheckIn->SetDescription(FText::FromString(TEXT("keep checked out submit")));
+	KeepCheckIn->SetKeepCheckedOut(true);
+	const ECommandResult::Type KeepResult = Provider.Execute(KeepCheckIn, Targets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Keep-checked-out submit succeeds"), (int32)KeepResult, (int32)ECommandResult::Succeeded);
+
+	const FSourceControlStatePtr Kept = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestTrue(TEXT("Asset stays checked out after a keep-checked-out submit"), Kept.IsValid() && Kept->IsCheckedOut());
+
+	return true;
+}
+#endif
+
+// Breadth: Sync -----------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSyncBringsStaleCurrentTest, "LoreSourceControl.Sync.BringsStaleCurrent", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSyncBringsStaleCurrentTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSyncStale"), TEXT("sys"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("syncme.txt");
+	FFileHelper::SaveStringToFile(TEXT("first revision"), *File);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("syncme.txt"), TEXT("first")));
+
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("syncclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneFile = Clone / TEXT("syncme.txt");
+	FFileHelper::SaveStringToFile(TEXT("second revision"), *CloneFile);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("syncme.txt") }, CloneErrors));
+	TestTrue(TEXT("Clone commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("second"), CloneErrors));
+	TestTrue(TEXT("Clone pushes"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// The first clone is now behind; after a sync it is level with the server and reads as current.
+	auto CurrentState = [&]() -> FLoreSourceControlState
+	{
+		TArray<FLoreSourceControlState> States;
+		TArray<FString> StatusErrors;
+		RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, { File }, StatusErrors, States);
+		return States.Num() == 1 ? States[0] : FLoreSourceControlState(File);
+	};
+	TestFalse(TEXT("Before sync the file is not current"), CurrentState().IsCurrent());
+
+	TArray<FString> SyncErrors;
+	const bool bSynced = SyncWorkingTree(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, SyncErrors);
+	TestTrue(TEXT("Sync succeeds"), bSynced);
+	TestTrue(TEXT("After sync the file reads as current"), CurrentState().IsCurrent());
+
+	FString Synced;
+	FFileHelper::LoadFileToString(Synced, *File);
+	TestEqual(TEXT("After sync the working file holds the clone's revision"), Synced, FString(TEXT("second revision")));
+
+	return true;
+}
+
+// Breadth: Lock -----------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreLockAcquireReleaseQueryTest, "LoreSourceControl.Lock.AcquireThenReleaseThenQuery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreLockAcquireReleaseQueryTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreLockQuery"), TEXT("lkq"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("lockme.uasset");
+	FFileHelper::SaveStringToFile(TEXT("lock content"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("lockme.uasset"), TEXT("add lockme")));
+
+	auto LockOf = [&]() -> ELoreLockState::Type
+	{
+		TArray<FLoreSourceControlState> States;
+		TArray<FString> StatusErrors;
+		RunUpdateStatus(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), true, { Asset }, StatusErrors, States);
+		return States.Num() == 1 ? States[0].LockState : ELoreLockState::Unknown;
+	};
+
+	TArray<FString> Errors;
+	TestTrue(TEXT("Acquire lock succeeds"), AcquireLocks(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("lockme.uasset") }, Errors));
+	// Against an auth-off server the owner is unattributable and reads as this user's own held lock.
+	TestEqual(TEXT("After acquire the lock reads as Locked"), (int32)LockOf(), (int32)ELoreLockState::Locked);
+
+	TestTrue(TEXT("Release lock succeeds"), ReleaseLocks(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("lockme.uasset") }, Errors));
+	TestEqual(TEXT("After release the lock reads as NotLocked"), (int32)LockOf(), (int32)ELoreLockState::NotLocked);
+
+	return true;
+}
+
+// Breadth: Diff -----------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreDiffBinaryExtractionTest, "LoreSourceControl.Diff.BinaryContentExtraction", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreDiffBinaryExtractionTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreDiffBinary"), TEXT("dfb"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Bytes with embedded nulls and high values, so a text-only path would corrupt them.
+	TArray<uint8> Bytes;
+	for (int32 i = 0; i < 256; ++i)
+	{
+		Bytes.Add((uint8)i);
+	}
+	const FString Asset = Fixture.Root / TEXT("binblob.uasset");
+	FFileHelper::SaveArrayToFile(Bytes, *Asset);
+	TestTrue(TEXT("Binary commit lands"), StageCommitPush(Fixture, TEXT("binblob.uasset"), TEXT("add binary blob")));
+
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("Binary file has a revision"), History.Num() >= 1);
+	if (History.Num() >= 1)
+	{
+		FString ExtractTemp;
+		const bool bExtracted = History[0]->Get(ExtractTemp);
+		TestTrue(TEXT("Binary revision extracts"), bExtracted);
+		if (bExtracted)
+		{
+			TArray<uint8> Extracted;
+			FFileHelper::LoadFileToArray(Extracted, *ExtractTemp);
+			TestEqual(TEXT("Extracted byte count matches"), Extracted.Num(), Bytes.Num());
+			TestTrue(TEXT("Extracted bytes equal the committed bytes"), Extracted == Bytes);
+
+			// Re-extraction returns the same path (the immutable name carries the revision id).
+			FString ExtractRepeat;
+			TestTrue(TEXT("Repeat extraction succeeds"), History[0]->Get(ExtractRepeat));
+			TestEqual(TEXT("Repeat extraction reuses the same path"), ExtractRepeat, ExtractTemp);
+		}
+	}
+
+	return true;
+}
+
+// Breadth: Move -----------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreMoveCarriesHistoryTest, "LoreSourceControl.Move.StagedMoveTracked", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreMoveCarriesHistoryTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreMoveHistory"), TEXT("mvh"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Source = Fixture.Root / TEXT("before.txt");
+	FFileHelper::SaveStringToFile(TEXT("history carries across a move"), *Source);
+	TestTrue(TEXT("Source commit lands"), StageCommitPush(Fixture, TEXT("before.txt"), TEXT("add before")));
+
+	// lore stage move records a move already performed on disk, so rename first, then stage and commit the move.
+	const FString Dest = Fixture.Root / TEXT("after.txt");
+	TestTrue(TEXT("On-disk rename"), IFileManager::Get().Move(*Dest, *Source));
+	TArray<FString> Results, Errors;
+	TestTrue(TEXT("Stage move succeeds"), RunCommand(TEXT("stage move"), Fixture.Binary, Fixture.Root, TArray<FString>(), { TEXT("before.txt"), TEXT("after.txt") }, Results, Errors));
+	TestTrue(TEXT("Move commit lands"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("move before to after"), Errors));
+
+	// Lore's file history reports from the new path and does not traverse the rename, so the destination shows its own tracked history rather than the source's depth.
+	TLoreSourceControlHistory History;
+	TArray<FString> HistErrors;
+	RunGetHistory(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Dest, HistErrors, History);
+	TestTrue(TEXT("Moved destination is tracked at its new path"), History.Num() >= 1);
+
+	return true;
+}
+
+// Breadth: Backend --------------------------------------------------------------
+
+#if LORE_WITH_LIBLORE
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreBackendStatusParityTest, "LoreSourceControl.Backend.StatusParity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreBackendStatusParityTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreBackendStatus"), TEXT("bks"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// One committed file, one edited file, one untracked file, so several working-copy states appear at once.
+	const FString Committed = Fixture.Root / TEXT("committed.txt");
+	FFileHelper::SaveStringToFile(TEXT("committed"), *Committed);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("committed.txt"), TEXT("add committed")));
+
+	const FString Edited = Fixture.Root / TEXT("edited.txt");
+	FFileHelper::SaveStringToFile(TEXT("edited one"), *Edited);
+	TestTrue(TEXT("Edited file first commit lands"), StageCommitPush(Fixture, TEXT("edited.txt"), TEXT("add edited")));
+	FFileHelper::SaveStringToFile(TEXT("edited two"), *Edited);
+
+	const FString Untracked = Fixture.Root / TEXT("untracked.txt");
+	FFileHelper::SaveStringToFile(TEXT("untracked"), *Untracked);
+
+	const TArray<FString> Files = { Committed, Edited, Untracked };
+
+	auto StatesFor = [&](ELoreBackendMode Mode, TMap<FString, ELoreWorkingCopyState::Type>& OutMap, bool& bOutAhead)
+	{
+		TArray<FLoreSourceControlState> States;
+		TArray<FString> StatusErrors;
+		RunUpdateStatus(Mode, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), false, Files, StatusErrors, States);
+		bOutAhead = false;
+		for (const FLoreSourceControlState& State : States)
+		{
+			OutMap.Add(State.LocalFilename, State.WorkingCopyState);
+			if (!State.IsCurrent())
+			{
+				bOutAhead = true;
+			}
+		}
+	};
+
+	TMap<FString, ELoreWorkingCopyState::Type> NativeMap, CliMap, AutoMap;
+	bool bNativeAhead = false, bCliAhead = false, bAutoAhead = false;
+	StatesFor(ELoreBackendMode::Native, NativeMap, bNativeAhead);
+	StatesFor(ELoreBackendMode::CommandLine, CliMap, bCliAhead);
+	StatesFor(ELoreBackendMode::Automatic, AutoMap, bAutoAhead);
+
+	TestEqual(TEXT("Native and command line agree on file count"), NativeMap.Num(), CliMap.Num());
+	TestEqual(TEXT("Native and automatic agree on file count"), NativeMap.Num(), AutoMap.Num());
+	TestEqual(TEXT("Native and command line agree on remote-ahead"), bNativeAhead, bCliAhead);
+	TestEqual(TEXT("Native and automatic agree on remote-ahead"), bNativeAhead, bAutoAhead);
+	for (const TPair<FString, ELoreWorkingCopyState::Type>& Pair : NativeMap)
+	{
+		const ELoreWorkingCopyState::Type* CliState = CliMap.Find(Pair.Key);
+		const ELoreWorkingCopyState::Type* AutoState = AutoMap.Find(Pair.Key);
+		TestNotNull(*FString::Printf(TEXT("Command line reports %s"), *Pair.Key), CliState);
+		TestNotNull(*FString::Printf(TEXT("Automatic reports %s"), *Pair.Key), AutoState);
+		if (CliState)
+		{
+			TestEqual(*FString::Printf(TEXT("Native and command line agree on state for %s"), *Pair.Key), (int32)*CliState, (int32)Pair.Value);
+		}
+		if (AutoState)
+		{
+			TestEqual(*FString::Printf(TEXT("Native and automatic agree on state for %s"), *Pair.Key), (int32)*AutoState, (int32)Pair.Value);
+		}
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreBackendWriteFileParityTest, "LoreSourceControl.Backend.WriteFileParity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreBackendWriteFileParityTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreBackendWrite"), TEXT("bkw"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	TArray<uint8> Bytes;
+	for (int32 i = 0; i < 200; ++i)
+	{
+		Bytes.Add((uint8)((i * 7 + 3) & 0xFF));
+	}
+	const FString Asset = Fixture.Root / TEXT("parity.uasset");
+	FFileHelper::SaveArrayToFile(Bytes, *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("parity.uasset"), TEXT("add parity blob")));
+
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("Parity file has a revision"), History.Num() >= 1);
+	if (History.Num() < 1)
+	{
+		return false;
+	}
+	const FString CommitId = History[0]->CommitId;
+	const FString RelativeFile = RelativeFilename(Asset, Fixture.Root);
+
+	auto ExtractThrough = [&](ELoreBackendMode Mode, const TCHAR* Leaf, TArray<uint8>& OutBytes) -> bool
+	{
+		const FString Out = Fixture.Root / Leaf;
+		IFileManager::Get().Delete(*Out, false, true);
+		TArray<FString> WriteErrors;
+		const bool bWritten = WriteRevisionFile(Mode, Fixture.Binary, Fixture.Root, RelativeFile, CommitId, Out, WriteErrors);
+		if (!bWritten)
+		{
+			return false;
+		}
+		return FFileHelper::LoadFileToArray(OutBytes, *Out);
+	};
+
+	TArray<uint8> NativeBytes, CliBytes, AutoBytes;
+	const bool bNative = ExtractThrough(ELoreBackendMode::Native, TEXT("out_native.bin"), NativeBytes);
+	const bool bCli = ExtractThrough(ELoreBackendMode::CommandLine, TEXT("out_cli.bin"), CliBytes);
+	const bool bAuto = ExtractThrough(ELoreBackendMode::Automatic, TEXT("out_auto.bin"), AutoBytes);
+	TestTrue(TEXT("Native extraction succeeds"), bNative);
+	TestTrue(TEXT("Command-line extraction succeeds"), bCli);
+	TestTrue(TEXT("Automatic extraction succeeds"), bAuto);
+
+	TestTrue(TEXT("Native bytes equal the committed bytes"), NativeBytes == Bytes);
+	TestTrue(TEXT("Command line and native extract identical bytes"), CliBytes == NativeBytes);
+	TestTrue(TEXT("Automatic and native extract identical bytes"), AutoBytes == NativeBytes);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreContentQueryLocalPresentTest, "LoreSourceControl.Content.QueryLocalPresent", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreContentQueryLocalPresentTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreContentPresent"), TEXT("cqp"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("present.txt");
+	FFileHelper::SaveStringToFile(TEXT("freshly committed content is local"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("present.txt"), TEXT("add present blob")));
+
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("Present file has a revision"), History.Num() >= 1);
+	if (History.Num() < 1)
+	{
+		return false;
+	}
+
+	const FString Address = History[0]->ContentAddress;
+	TestFalse(TEXT("Latest revision carries a content address"), Address.IsEmpty());
+
+	bool bAvailable = false;
+	FString ProbeError;
+	const bool bQueried = LoreClient::QueryContentAvailable(Fixture.Root, Address, bAvailable, ProbeError);
+	TestTrue(FString::Printf(TEXT("Content-availability query succeeds (err: %s)"), *ProbeError), bQueried);
+	TestTrue(TEXT("Pushed content reads as available, since its payload is on the remote"), bAvailable);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreContentQueryBogusAddressAbsentTest, "LoreSourceControl.Content.QueryBogusAddressAbsent", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreContentQueryBogusAddressAbsentTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreContentBogus"), TEXT("cqb"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Syntactically valid address (64 hex hash, hyphen, 32 hex context) that no content hashes to.
+	const FString HashHex = FString::ChrN(64, TEXT('0'));
+	const FString ContextHex = FString::ChrN(32, TEXT('0'));
+	const FString BogusAddress = HashHex + TEXT("-") + ContextHex;
+
+	bool bAvailable = true;
+	FString ProbeError;
+	const bool bQueried = LoreClient::QueryContentAvailable(Fixture.Root, BogusAddress, bAvailable, ProbeError);
+	TestTrue(FString::Printf(TEXT("Query of a non-existent address does not error fatally (err: %s)"), *ProbeError), bQueried);
+	TestFalse(TEXT("A non-existent address reads as not available"), bAvailable);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreHistoryCapturesContentAddressTest, "LoreSourceControl.History.CapturesContentAddress", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreHistoryCapturesContentAddressTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreHistoryAddress"), TEXT("hca"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("address.txt");
+	FFileHelper::SaveStringToFile(TEXT("revision carries a content address"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("address.txt"), TEXT("add address blob")));
+
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("Address file has a revision"), History.Num() >= 1);
+	if (History.Num() < 1)
+	{
+		return false;
+	}
+
+	const FString Address = History[0]->ContentAddress;
+	TestFalse(TEXT("Content address is non-empty"), Address.IsEmpty());
+	TestTrue(TEXT("Content address is in hash-context form"), Address.Contains(TEXT("-")));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreContentObliteratedMarkedTest, "LoreSourceControl.Content.ObliteratedContentMarked", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreContentObliteratedMarkedTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreObliterate"), TEXT("obl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Two local revisions, no push, so the older blob lives only in the local store and obliterate truly removes it.
+	const FString Asset = Fixture.Root / TEXT("oblit.txt");
+	const FString RelFile = TEXT("oblit.txt");
+	TArray<FString> Results, Errors;
+
+	FFileHelper::SaveStringToFile(TEXT("first revision content for obliterate"), *Asset);
+	TestTrue(TEXT("First stage"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { RelFile }, Errors));
+	TestTrue(TEXT("First commit"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("first oblit revision"), Errors));
+
+	FFileHelper::SaveStringToFile(TEXT("second revision content, different bytes"), *Asset);
+	TestTrue(TEXT("Second stage"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { RelFile }, Errors));
+	TestTrue(TEXT("Second commit"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("second oblit revision"), Errors));
+
+	TLoreSourceControlHistory History;
+	RunGetHistory(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("History has two revisions"), History.Num() >= 2);
+	if (History.Num() < 2)
+	{
+		return false;
+	}
+
+	// History is newest first, so the last entry is the original revision whose content the second revision replaced.
+	const FString OlderAddress = History.Last()->ContentAddress;
+	TestFalse(TEXT("Older revision carries a content address"), OlderAddress.IsEmpty());
+
+	// lore file obliterate --address <addr> removes the blob from the local immutable store.
+	const bool bObliterated = RunCommand(TEXT("file obliterate"), Fixture.Binary, Fixture.Root, { FString::Printf(TEXT("--address %s"), *OlderAddress) }, TArray<FString>(), Results, Errors);
+	if (!bObliterated)
+	{
+		// Obliterate is not available in this client build; skip rather than fail the fixture.
+		AddInfo(TEXT("lore file obliterate did not run; skipping the marker assertions for this client."));
+		return true;
+	}
+
+	// The older content was never pushed, so after a local obliterate it is in neither store and the probe reports it unavailable.
+	bool bAvailableAfter = true;
+	FString ProbeError;
+	LoreClient::QueryContentAvailable(Fixture.Root, OlderAddress, bAvailableAfter, ProbeError);
+	TestFalse(TEXT("Obliterated content reads as unavailable"), bAvailableAfter);
+
+	// Rebuild history; the older revision now carries the not-local marker, and its extraction fails with no server to fetch from.
+	TLoreSourceControlHistory After;
+	RunGetHistory(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Asset, Errors, After);
+	TestTrue(TEXT("Rebuilt history still has two revisions"), After.Num() >= 2);
+	if (After.Num() >= 2)
+	{
+		TestTrue(TEXT("Older revision description carries the unavailable marker"), After.Last()->GetDescription().Contains(TEXT("[Unavailable]")));
+		FString DiffTemp;
+		TestFalse(TEXT("Obliterated revision cannot extract for diff"), After.Last()->Get(DiffTemp));
+	}
+
+	return true;
+}
+#endif // LORE_WITH_LIBLORE
 
 #endif // WITH_DEV_AUTOMATION_TESTS

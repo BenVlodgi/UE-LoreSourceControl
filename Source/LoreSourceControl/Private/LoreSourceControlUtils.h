@@ -24,8 +24,8 @@ namespace LoreSourceControlUtils
 	/** Build the relative-path to owner map the CLI lock parser yields from a liblore lock-status result. */
 	void ParseLocksFromClient(const TArray<LoreClient::FLockStatus>& InLocks, TMap<FString, FString>& OutLocks);
 
-	/** Build revision records from a liblore file-history result, applying the same action labels and short-id rule the CLI history path uses. */
-	void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FHistoryRevision>& InRevisions, const FString& InAbsoluteFile, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TLoreSourceControlHistory& OutHistory);
+	/** Build revision records from a liblore file-history result, applying the same action labels and short-id rule the CLI history path uses. bRemoteReachable lets the content-availability probe consult the remote; pass false when the remote is known down to keep the probe local-only and fast. */
+	void BuildHistoryFromClient(ELoreBackendMode InMode, const TArray<LoreClient::FHistoryRevision>& InRevisions, const FString& InAbsoluteFile, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, TLoreSourceControlHistory& OutHistory, bool bRemoteReachable = true);
 #endif
 
 	/** Parse `lore lock status --json` event lines into a relative-path to owner map. Exposed for tests. */
@@ -112,8 +112,8 @@ namespace LoreSourceControlUtils
 	/** Scan the given files and parse their working-copy and lock state. */
 	bool RunUpdateStatus(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InIdentity, bool bInUsingLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FLoreSourceControlState>& OutStates);
 
-	/** Read a file's revision history into shared revision records. */
-	bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory);
+	/** Read a file's revision history into shared revision records. bRemoteReachable is forwarded to the content-availability probe so a known-down remote is not contacted per revision. */
+	bool RunGetHistory(ELoreBackendMode InMode, const FString& InPathToLoreBinary, const FString& InRepositoryRoot, const FString& InFile, TArray<FString>& OutErrorMessages, TLoreSourceControlHistory& OutHistory, bool bRemoteReachable = true);
 
 	/** Collect reasons a submit must be refused before it mutates the staged set. With bAllowOverLock a foreign lock no longer blocks; an unresolved conflict always does. Returns true when any file blocks the submit. */
 	bool CollectCheckInBlockers(const TArray<FLoreSourceControlState>& InStates, bool bAllowOverLock, TArray<FString>& OutMessages);

@@ -118,7 +118,7 @@ bool FLoreUpdateStatusWorker::Execute(FLoreSourceControlCommand& InCommand)
 		for (FLoreSourceControlState& State : States)
 		{
 			TLoreSourceControlHistory History;
-			LoreSourceControlUtils::RunGetHistory(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, State.LocalFilename, InCommand.ErrorMessages, History);
+			LoreSourceControlUtils::RunGetHistory(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, State.LocalFilename, InCommand.ErrorMessages, History, InCommand.bRemoteAvailable);
 			State.History = History;
 		}
 	}
@@ -332,12 +332,6 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 	// FCheckIn gained the flag in 5.1; earlier editors always release on submit.
 	const bool bKeepCheckedOut = false;
 #endif
-	// Do not release a lock held by someone else when forcing over it; we never held it.
-	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking && !bKeepCheckedOut && !bForceOverLock)
-	{
-		LoreSourceControlUtils::ReleaseLocks(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, RelativeFiles, InCommand.ErrorMessages);
-	}
-
 	if (InCommand.bCommandSuccessful)
 	{
 		TArray<FString> Names;
@@ -356,6 +350,23 @@ static bool RunCheckIn(FLoreSourceControlCommand& InCommand, TArray<FLoreSourceC
 	RefreshStates(InCommand, States);
 	if (InCommand.bCommandSuccessful && InCommand.bUsingLocking)
 	{
+		// Release after refreshing, then assert NotLocked rather than trusting the re-read: against an auth-off server a just-released lock reads back as still held, which would leave the file checked out and its read-only bit wrong on the next edit. Mirrors the revert worker. Keep Files Checked Out and a forced foreign lock skip the release.
+		if (!bKeepCheckedOut && !bForceOverLock)
+		{
+			TArray<FString> LockedRelative;
+			for (FLoreSourceControlState& State : States)
+			{
+				if (State.LockState == ELoreLockState::Locked)
+				{
+					LockedRelative.Add(LoreSourceControlUtils::RelativeFilename(State.LocalFilename, InCommand.PathToRepositoryRoot));
+					State.LockState = ELoreLockState::NotLocked;
+				}
+			}
+			if (LockedRelative.Num() > 0)
+			{
+				LoreSourceControlUtils::ReleaseLocks(InCommand.BackendMode, InCommand.PathToLoreBinary, InCommand.PathToRepositoryRoot, LockedRelative, InCommand.ErrorMessages);
+			}
+		}
 		ApplyReadOnlyFromStates(States);
 	}
 	return InCommand.bCommandSuccessful;
