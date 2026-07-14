@@ -59,11 +59,30 @@ void FLoreSourceControlModule::StartupModule()
 	Provider.RegisterWorker("CheckInOverLock", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCheckInOverLockWorker>));
 	Provider.RegisterWorker("Copy", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCopyWorker>));
 	Provider.RegisterWorker("Resolve", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreResolveWorker>));
+	// Read workers for the branches window and history browser; the windows that dispatch them arrive in the next chunk, gated to 5.1, but the data layer registers on every engine so the headless tests run everywhere.
+	Provider.RegisterWorker("GetBranches", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreGetBranchesWorker>));
+	Provider.RegisterWorker("GetRevisions", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreGetRevisionsWorker>));
+	Provider.RegisterWorker("GetRevisionFiles", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreGetRevisionFilesWorker>));
+	// The guarded branch write workers. Registered on every engine so the operations, guards, and recovery arm are headlessly testable; the widget entries that dispatch them stay behind the 5.1 UI gate and light up now that these register.
+	Provider.RegisterWorker("SwitchBranch", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreSwitchBranchWorker>));
+	Provider.RegisterWorker("CreateBranch", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreCreateBranchWorker>));
+	Provider.RegisterWorker("ArchiveBranch", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreArchiveBranchWorker>));
+	Provider.RegisterWorker("ProtectBranch", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreProtectBranchWorker>));
+	Provider.RegisterWorker("UnprotectBranch", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreUnprotectBranchWorker>));
+#if LORE_UE5_3_OR_LATER
+	// Changelist workers edit only the plugin-owned store; the Changes view stays hidden until UsesChangelists turns true.
+	Provider.RegisterWorker("NewChangelist", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreNewChangelistWorker>));
+	Provider.RegisterWorker("DeleteChangelist", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreDeleteChangelistWorker>));
+	Provider.RegisterWorker("EditChangelist", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreEditChangelistWorker>));
+	Provider.RegisterWorker("MoveToChangelist", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreMoveToChangelistWorker>));
+	Provider.RegisterWorker("UpdateChangelistsStatus", FGetLoreSourceControlWorker::CreateStatic(&CreateWorker<FLoreUpdateChangelistsStatusWorker>));
+#endif
 
 	IModularFeatures::Get().RegisterModularFeature("SourceControl", &Provider);
 
 #if WITH_EDITOR && LORE_UE5_1_OR_LATER
 	AssetMenu.Register();
+	Windows.Register();
 #endif
 
 #if WITH_EDITOR && LORE_UE5_8_OR_LATER
@@ -74,6 +93,7 @@ void FLoreSourceControlModule::StartupModule()
 void FLoreSourceControlModule::ShutdownModule()
 {
 #if WITH_EDITOR && LORE_UE5_1_OR_LATER
+	Windows.Unregister();
 	AssetMenu.Unregister();
 #endif
 

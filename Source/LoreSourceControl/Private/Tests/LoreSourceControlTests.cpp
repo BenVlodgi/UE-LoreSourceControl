@@ -11,6 +11,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
+#include "Async/Async.h"
 #include "ISourceControlModule.h"
 #include "ISourceControlProvider.h"
 #include "ISourceControlState.h"
@@ -19,6 +20,17 @@
 #include "LoreSourceControlUtils.h"
 #include "LoreSourceControlModule.h"
 #include "LoreSourceControlProvider.h"
+#include "LorePluginStore.h"
+#include "LoreChangelistStore.h"
+#include "LoreOperationMarker.h"
+#include "LoreGuardedRewrite.h"
+#include "LoreSourceControlCommand.h"
+#include "LoreSourceControlOperations.h"
+#include "ILoreSourceControlWorker.h"
+#include "LoreSourceControlChangelist.h"
+#include "LoreSourceControlChangelistState.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 
 #if LORE_WITH_LIBLORE
 #include "LoreCApi.h"
@@ -315,6 +327,32 @@ bool FLoreSourceControlLockParseTest::RunTest(const FString& Parameters)
 	TMap<FString, FString> NoLocks;
 	LoreSourceControlUtils::ParseLocksForTest(Noise, NoLocks);
 	TestEqual(TEXT("Noise yields no locks"), NoLocks.Num(), 0);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSyncDeltaParseTest, "LoreSourceControl.SyncDeltaParse", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSyncDeltaParseTest::RunTest(const FString& Parameters)
+{
+	// A dry-run sync's revisionSyncFile events name each file a sync would touch, with the action token and flagFile. A directory entry and a non-event line carry no file to protect.
+	const TArray<FString> Lines = {
+		TEXT("{\"tagName\":\"revisionSyncTarget\",\"data\":{\"branchName\":\"main\"}}"),
+		TEXT("{\"tagName\":\"revisionSyncFile\",\"data\":{\"path\":\"Content/Maps/Arena.umap\",\"size\":4096,\"action\":\"keep\",\"flagFile\":1}}"),
+		TEXT("{\"tagName\":\"revisionSyncFile\",\"data\":{\"path\":\"Content/Props/Crate.uasset\",\"size\":2048,\"action\":\"add\",\"flagFile\":1}}"),
+		TEXT("{\"tagName\":\"revisionSyncFile\",\"data\":{\"path\":\"Content/Old.uasset\",\"size\":0,\"action\":\"delete\",\"flagFile\":1}}"),
+		TEXT("{\"tagName\":\"revisionSyncFile\",\"data\":{\"path\":\"Content\\\\Props\",\"size\":0,\"action\":\"keep\",\"flagFile\":0}}"),
+		TEXT("some banner"),
+		TEXT("{\"tagName\":\"complete\",\"data\":{\"status\":0}}"),
+	};
+	TArray<FLoreDeltaEntry> Delta;
+	LoreSourceControlUtils::ParseSyncDeltaForTest(Lines, Delta);
+
+	TestEqual(TEXT("Three files parsed, the directory entry skipped"), Delta.Num(), 3);
+	TestEqual(TEXT("First path is the map"), Delta[0].Path, FString(TEXT("Content/Maps/Arena.umap")));
+	TestEqual(TEXT("A modified file reads keep"), Delta[0].Action, FString(TEXT("keep")));
+	TestEqual(TEXT("An added file reads add"), Delta[1].Action, FString(TEXT("add")));
+	TestEqual(TEXT("A removed file reads delete"), Delta[2].Action, FString(TEXT("delete")));
 
 	return true;
 }
@@ -1672,6 +1710,563 @@ bool FLoreSyncBringsStaleCurrentTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreStatusAnchorsReadTest, "LoreSourceControl.Sync.StatusRevisionAnchors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreStatusAnchorsReadTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreAnchors"), TEXT("anc"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("anchor.txt");
+	FFileHelper::SaveStringToFile(TEXT("first"), *File);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("anchor.txt"), TEXT("first")));
+
+	// Both backends read the same branch, current revision, and remote latest off the status revision header.
+	for (const ELoreBackendMode Mode : { ELoreBackendMode::CommandLine, ELoreBackendMode::Native })
+	{
+		FLoreStatusAnchors Anchors;
+		TArray<FString> Errors;
+		const bool bRead = GetStatusRevisionAnchors(Mode, Fixture.Binary, Fixture.Root, Anchors, Errors);
+		TestTrue(FString::Printf(TEXT("Anchors read (mode %d)"), (int32)Mode), bRead);
+		TestEqual(FString::Printf(TEXT("Branch is main (mode %d)"), (int32)Mode), Anchors.BranchName, FString(TEXT("main")));
+		TestTrue(FString::Printf(TEXT("Current revision is a non-empty hash (mode %d)"), (int32)Mode), !Anchors.CurrentRevision.IsEmpty());
+		TestTrue(FString::Printf(TEXT("Current revision number advanced past zero (mode %d)"), (int32)Mode), Anchors.CurrentRevisionNumber > 0);
+		// The tree pushed its revision, so the remote latest matches the current revision.
+		TestEqual(FString::Printf(TEXT("Remote latest equals the pushed revision (mode %d)"), (int32)Mode), Anchors.RemoteRevision, Anchors.CurrentRevision);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSyncDeltaEnumerateTest, "LoreSourceControl.Sync.DeltaEnumeration", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSyncDeltaEnumerateTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSyncDelta"), TEXT("sd"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("delta.txt");
+	FFileHelper::SaveStringToFile(TEXT("first revision content"), *File);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("delta.txt"), TEXT("first")));
+
+	// A second clone commits a change and pushes it, so the first tree is now one revision behind.
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("deltaclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneFile = Clone / TEXT("delta.txt");
+	FFileHelper::SaveStringToFile(TEXT("second revision content"), *CloneFile);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("delta.txt") }, CloneErrors));
+	TestTrue(TEXT("Clone commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("second"), CloneErrors));
+	TestTrue(TEXT("Clone pushes"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// The proving test: the dry-run names exactly the changed file with the keep action, and changes nothing. A modified file rewrites in place, so its action is keep.
+	for (const ELoreBackendMode Mode : { ELoreBackendMode::CommandLine, ELoreBackendMode::Native })
+	{
+		TArray<FLoreDeltaEntry> Delta;
+		TArray<FString> Errors;
+		const bool bEnumerated = EnumerateSyncDelta(Mode, Fixture.Binary, Fixture.Root, Delta, Errors);
+		TestTrue(FString::Printf(TEXT("Delta enumerated (mode %d)"), (int32)Mode), bEnumerated);
+
+		const FLoreDeltaEntry* Entry = Delta.FindByPredicate([](const FLoreDeltaEntry& E) { return E.Path.EndsWith(TEXT("delta.txt")); });
+		TestNotNull(FString::Printf(TEXT("The changed file is in the delta (mode %d)"), (int32)Mode), Entry);
+		if (Entry)
+		{
+			TestEqual(FString::Printf(TEXT("A modified file reads keep (mode %d)"), (int32)Mode), Entry->Action, FString(TEXT("keep")));
+		}
+
+		// Dry run touches nothing: the working file still holds the pre-sync content and the anchor has not moved.
+		FString OnDisk;
+		FFileHelper::LoadFileToString(OnDisk, *File);
+		TestEqual(FString::Printf(TEXT("The working file is unchanged by the dry run (mode %d)"), (int32)Mode), OnDisk, FString(TEXT("first revision content")));
+
+		FLoreStatusAnchors Anchors;
+		TArray<FString> AnchorErrors;
+		GetStatusRevisionAnchors(Mode, Fixture.Binary, Fixture.Root, Anchors, AnchorErrors);
+		TestTrue(FString::Printf(TEXT("The branch is still behind the remote after the dry run (mode %d)"), (int32)Mode), Anchors.RemoteRevision != Anchors.CurrentRevision);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSwitchDeltaEnumerateTest, "LoreSourceControl.Switch.DeltaEnumeration", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSwitchDeltaEnumerateTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSwitchDelta"), TEXT("swd"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Seed main with a file, then branch off. Create switches to the new branch in the same step, so a divergent commit here lands on feature.
+	const FString File = Fixture.Root / TEXT("shared.txt");
+	FFileHelper::SaveStringToFile(TEXT("main content"), *File);
+	TestTrue(TEXT("Seed commit on main lands"), StageCommitPush(Fixture, TEXT("shared.txt"), TEXT("main-seed")));
+
+	TArray<FString> Errors;
+	TestTrue(TEXT("Branch create succeeds and switches"), RunBranchCreate(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("feature"), FString(), Errors));
+
+	// A divergent commit on feature, so main and feature differ by this file's content.
+	FFileHelper::SaveStringToFile(TEXT("feature content, longer than main"), *File);
+	TestTrue(TEXT("Feature commit lands"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("shared.txt") }, Errors));
+	TestTrue(TEXT("Feature commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("feature-change"), Errors));
+
+	// The proving test: a dry-run switch from feature back to main names exactly the changed file with the keep action and changes nothing on disk.
+	for (const ELoreBackendMode Mode : { ELoreBackendMode::CommandLine, ELoreBackendMode::Native })
+	{
+		TArray<FLoreDeltaEntry> Delta;
+		TArray<FString> EnumErrors;
+		const bool bEnumerated = EnumerateSwitchDelta(Mode, Fixture.Binary, Fixture.Root, TEXT("main"), FString(), Delta, EnumErrors);
+		TestTrue(FString::Printf(TEXT("Switch delta enumerated (mode %d, err: %s)"), (int32)Mode, *FString::Join(EnumErrors, TEXT("; "))), bEnumerated);
+
+		const FLoreDeltaEntry* Entry = Delta.FindByPredicate([](const FLoreDeltaEntry& E) { return E.Path.EndsWith(TEXT("shared.txt")); });
+		TestNotNull(FString::Printf(TEXT("The changed file is in the switch delta (mode %d)"), (int32)Mode), Entry);
+		if (Entry)
+		{
+			// A file present in both revisions with different content rewrites in place, so its action is keep.
+			TestEqual(FString::Printf(TEXT("A rewritten file reads keep (mode %d)"), (int32)Mode), Entry->Action, FString(TEXT("keep")));
+		}
+
+		// Dry run touches nothing: the working file still holds the feature content, and the tree is still on feature.
+		FString OnDisk;
+		FFileHelper::LoadFileToString(OnDisk, *File);
+		TestEqual(FString::Printf(TEXT("The working file is unchanged by the dry-run switch (mode %d)"), (int32)Mode), OnDisk, FString(TEXT("feature content, longer than main")));
+
+		FString CurrentBranch;
+		GetBranchName(Mode, Fixture.Binary, Fixture.Root, CurrentBranch);
+		TestEqual(FString::Printf(TEXT("The tree is still on feature after the dry run (mode %d)"), (int32)Mode), CurrentBranch, FString(TEXT("feature")));
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreGuardedSwitchRoundTripTest, "LoreSourceControl.Switch.GuardedRoundTrip", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreGuardedSwitchRoundTripTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSwitchRT"), TEXT("swr"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Seed main with a binary asset, then create feature (which switches to it in the same step) and diverge it.
+	const FString Asset = Fixture.Root / TEXT("Content/Switch.uasset");
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Asset), true);
+	FFileHelper::SaveStringToFile(TEXT("main asset content"), *Asset);
+	TestTrue(TEXT("Seed commit on main lands"), StageCommitPush(Fixture, TEXT("Content/Switch.uasset"), TEXT("main-seed")));
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	// Create the branch through the provider. Create switches the tree to it and rewrites no files.
+	TSharedRef<FLoreCreateBranch, ESPMode::ThreadSafe> Create = ISourceControlOperation::Create<FLoreCreateBranch>();
+	Create->BranchName = TEXT("feature");
+	TestEqual(TEXT("Create branch succeeds through the provider"), (int32)Provider.Execute(Create, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	FString BranchAfterCreate;
+	GetBranchName(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, BranchAfterCreate);
+	TestEqual(TEXT("The tree is on feature after create"), BranchAfterCreate, FString(TEXT("feature")));
+
+	// Diverge feature: rewrite the asset and commit, so main and feature differ by this file. Push it so it exists on the remote, which archive needs (archive on a remote-absent branch fails "Not found").
+	FFileHelper::SaveStringToFile(TEXT("feature asset content, changed"), *Asset);
+	TArray<FString> Errors;
+	TestTrue(TEXT("Feature stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("Content/Switch.uasset") }, Errors));
+	TestTrue(TEXT("Feature commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("feature-change"), Errors));
+	TestTrue(TEXT("Feature pushes"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Errors));
+
+	// The asset is read-only under the locking policy, the exact file the unguarded switch aborts on.
+	SetFilesReadOnly({ Asset }, true);
+	TestTrue(TEXT("The asset is read-only before the guarded switch"), IFileManager::Get().IsReadOnly(*Asset));
+
+	// Switch back to main through the provider. The guard clears read-only on the delta, switches, verifies, and reapplies read-only.
+	TSharedRef<FLoreSwitchBranch, ESPMode::ThreadSafe> Switch = ISourceControlOperation::Create<FLoreSwitchBranch>();
+	Switch->BranchName = TEXT("main");
+	TestEqual(TEXT("Switch to main succeeds through the provider"), (int32)Provider.Execute(Switch, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	FString BranchAfterSwitch;
+	GetBranchName(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, BranchAfterSwitch);
+	TestEqual(TEXT("The tree lands on main after the switch"), BranchAfterSwitch, FString(TEXT("main")));
+
+	FString OnDisk;
+	FFileHelper::LoadFileToString(OnDisk, *Asset);
+	TestEqual(TEXT("The asset carries main's content after the switch"), OnDisk, FString(TEXT("main asset content")));
+	TestTrue(TEXT("Read-only is reapplied per the locking policy after the switch"), IFileManager::Get().IsReadOnly(*Asset));
+	TestFalse(TEXT("No marker remains after a verified switch"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+	TestTrue(TEXT("The switch reported the rewritten file"), Switch->UpdatedFiles.ContainsByPredicate([](const FString& P) { return P.EndsWith(TEXT("Switch.uasset")); }));
+
+	// Protect main through the provider, then read the flag back through BranchMetadataGet.
+	TSharedRef<FLoreProtectBranch, ESPMode::ThreadSafe> Protect = ISourceControlOperation::Create<FLoreProtectBranch>();
+	Protect->BranchName = TEXT("main");
+	TestEqual(TEXT("Protect main succeeds through the provider"), (int32)Provider.Execute(Protect, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	FString ProtectValue;
+	bool bProtectFound = false;
+	TArray<FString> ProtectReadErrors;
+	TestTrue(TEXT("Protect flag reads back"), RunBranchMetadataGet(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("main"), TEXT("protect"), ProtectValue, bProtectFound, ProtectReadErrors));
+	TestTrue(TEXT("Protect flag reads true after protect"), bProtectFound && ProtectValue == TEXT("true"));
+
+	// Unprotect through the provider, then confirm the flag no longer reads true.
+	TSharedRef<FLoreUnprotectBranch, ESPMode::ThreadSafe> Unprotect = ISourceControlOperation::Create<FLoreUnprotectBranch>();
+	Unprotect->BranchName = TEXT("main");
+	TestEqual(TEXT("Unprotect main succeeds through the provider"), (int32)Provider.Execute(Unprotect, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	ProtectValue.Empty(); bProtectFound = false;
+	RunBranchMetadataGet(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("main"), TEXT("protect"), ProtectValue, bProtectFound, ProtectReadErrors);
+	TestFalse(TEXT("Protect flag does not read true after unprotect"), ProtectValue == TEXT("true"));
+
+	// Archive feature through the provider; the branch then drops out of the default listing.
+	TSharedRef<FLoreArchiveBranch, ESPMode::ThreadSafe> Archive = ISourceControlOperation::Create<FLoreArchiveBranch>();
+	Archive->BranchName = TEXT("feature");
+	TestEqual(TEXT("Archive feature succeeds through the provider"), (int32)Provider.Execute(Archive, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	TArray<FLoreBranchItem> Branches;
+	TArray<FString> ListErrors;
+	TestTrue(TEXT("Branch listing succeeds after archive"), RunGetBranches(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, false, Branches, ListErrors));
+	TestFalse(TEXT("The archived branch is absent from the default listing"), Branches.ContainsByPredicate([](const FLoreBranchItem& B) { return B.Name == TEXT("feature"); }));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreGuardedRewriteSuccessTest, "LoreSourceControl.Guard.SuccessRestoresReadOnly", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreGuardedRewriteSuccessTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreGuardOk"), TEXT("gk"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// A committed binary asset the first tree does not lock is read-only under the locking policy, which is exactly the file Lore's rewrite aborts on. Land one, then diverge it from a second clone.
+	const FString Asset = Fixture.Root / TEXT("Content/Guarded.uasset");
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Asset), true);
+	FFileHelper::SaveStringToFile(TEXT("first binary revision"), *Asset);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("Content/Guarded.uasset"), TEXT("first")));
+
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("guardclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneAsset = Clone / TEXT("Content/Guarded.uasset");
+	FFileHelper::SaveStringToFile(TEXT("second binary revision, longer"), *CloneAsset);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("Content/Guarded.uasset") }, CloneErrors));
+	TestTrue(TEXT("Clone commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("second"), CloneErrors));
+	TestTrue(TEXT("Clone pushes"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// The file is read-only, standing in for a not-checked-out binary asset. An unguarded sync would abort here.
+	SetFilesReadOnly({ Asset }, true);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	TestTrue(TEXT("The asset is read-only before the guarded sync"), PlatformFile.FileExists(*Asset) && IFileManager::Get().IsReadOnly(*Asset));
+
+	// Point the provider at the fixture and turn locking on, so a command constructed here carries the right root and policy.
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	// Enumerate the delta, then run a real sync as the rewrite callback through the guard.
+	TArray<FLoreDeltaEntry> Delta;
+	TArray<FString> EnumErrors;
+	TestTrue(TEXT("Delta enumerated"), EnumerateSyncDelta(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Delta, EnumErrors));
+	TestTrue(TEXT("The read-only asset is in the delta"), Delta.ContainsByPredicate([](const FLoreDeltaEntry& E) { return E.Path.EndsWith(TEXT("Guarded.uasset")); }));
+
+	FLoreSourceControlCommand Command(ISourceControlOperation::Create<FSync>(), MakeShared<FLoreSyncWorker, ESPMode::ThreadSafe>());
+	Command.PathToRepositoryRoot = Fixture.Root;
+	Command.PathToLoreBinary = Fixture.Binary;
+	Command.BackendMode = ELoreBackendMode::Automatic;
+	Command.Identity = TEXT("test@example.com");
+	Command.bUsingLocking = true;
+	Command.bRemoteAvailable = true;
+
+	LoreGuardedRewrite::FRewriteRequest Request;
+	Request.Kind = ELoreOperationKind::RevisionSync;
+	Request.SourceBranch = TEXT("main");
+	Request.Delta = Delta;
+
+	TArray<FLoreSourceControlState> States;
+	const bool bGuarded = LoreGuardedRewrite::Run(Request, Command, [&](TArray<FString>& OutErrors)
+	{
+		return SyncWorkingTree(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, OutErrors);
+	}, States);
+
+	TestTrue(TEXT("The guarded sync succeeds through a read-only file"), bGuarded);
+
+	FString OnDisk;
+	FFileHelper::LoadFileToString(OnDisk, *Asset);
+	TestEqual(TEXT("The asset carries the synced content"), OnDisk, FString(TEXT("second binary revision, longer")));
+	TestTrue(TEXT("Read-only is reapplied per the locking policy after the sync"), IFileManager::Get().IsReadOnly(*Asset));
+	TestFalse(TEXT("No marker remains after a verified success"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreGuardedRewriteFailureTest, "LoreSourceControl.Guard.FailureKeepsMarker", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreGuardedRewriteFailureTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreGuardFail"), TEXT("gf"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("kept.txt");
+	FFileHelper::SaveStringToFile(TEXT("content"), *File);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("kept.txt"), TEXT("first")));
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	FLoreSourceControlCommand Command(ISourceControlOperation::Create<FSync>(), MakeShared<FLoreSyncWorker, ESPMode::ThreadSafe>());
+	Command.PathToRepositoryRoot = Fixture.Root;
+	Command.PathToLoreBinary = Fixture.Binary;
+	Command.BackendMode = ELoreBackendMode::Automatic;
+	Command.Identity = TEXT("test@example.com");
+	Command.bUsingLocking = false;
+	Command.bRemoteAvailable = true;
+
+	LoreGuardedRewrite::FRewriteRequest Request;
+	Request.Kind = ELoreOperationKind::RevisionSync;
+	Request.SourceBranch = TEXT("main");
+	Request.Delta = { FLoreDeltaEntry{ TEXT("kept.txt"), TEXT("keep") } };
+
+	// A callback that returns false stands for a killed subprocess or an aborted realization.
+	TArray<FLoreSourceControlState> States;
+	const bool bGuarded = LoreGuardedRewrite::Run(Request, Command, [](TArray<FString>& OutErrors)
+	{
+		OutErrors.Add(TEXT("simulated rewrite failure"));
+		return false;
+	}, States);
+
+	TestFalse(TEXT("A failed rewrite returns false"), bGuarded);
+	TestTrue(TEXT("The states were refreshed so the cache shows the tear"), States.Num() > 0);
+	const FLoreOperationMarker Marker = LoreOperationMarker::Read(Fixture.Root);
+	TestTrue(TEXT("The marker stays for recovery after a failed rewrite"), Marker.IsValid());
+	TestEqual(TEXT("The marker records the sync kind"), (int32)Marker.Kind, (int32)ELoreOperationKind::RevisionSync);
+	LoreOperationMarker::Clear(Fixture.Root);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreSyncProviderGuardedTest, "LoreSourceControl.Sync.ProviderGuardedThroughReadOnly", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreSyncProviderGuardedTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSyncProv"), TEXT("sp"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("Content/ProvSync.uasset");
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Asset), true);
+	FFileHelper::SaveStringToFile(TEXT("first"), *Asset);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("Content/ProvSync.uasset"), TEXT("first")));
+
+	const FString Clone = Fixture.CloneSecondTree(*this, TEXT("provclone"));
+	if (Clone.IsEmpty())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*FPaths::GetPath(Clone), false, true); };
+
+	const FString CloneAsset = Clone / TEXT("Content/ProvSync.uasset");
+	FFileHelper::SaveStringToFile(TEXT("second, from the clone"), *CloneAsset);
+	TArray<FString> CloneErrors;
+	TestTrue(TEXT("Clone stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Clone, { TEXT("Content/ProvSync.uasset") }, CloneErrors));
+	TestTrue(TEXT("Clone commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Clone, TEXT("test@example.com"), TEXT("second"), CloneErrors));
+	TestTrue(TEXT("Clone pushes"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Clone, CloneErrors));
+
+	// The not-checked-out binary asset is read-only, the exact file the unguarded sync aborted on.
+	SetFilesReadOnly({ Asset }, true);
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	const FString Absolute = FPaths::ConvertRelativePathToFull(Asset);
+	const ECommandResult::Type SyncResult = Provider.Execute(ISourceControlOperation::Create<FSync>(), { Absolute }, EConcurrency::Synchronous);
+	TestEqual(TEXT("FSync through the provider succeeds over a read-only delta file"), (int32)SyncResult, (int32)ECommandResult::Succeeded);
+
+	FString OnDisk;
+	FFileHelper::LoadFileToString(OnDisk, *Asset);
+	TestEqual(TEXT("The asset carries the synced content"), OnDisk, FString(TEXT("second, from the clone")));
+	TestFalse(TEXT("No marker remains after the guarded provider sync"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreInterruptedRewriteRecoveryTest, "LoreSourceControl.Recovery.DetectAndRepair", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreInterruptedRewriteRecoveryTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreRecovery"), TEXT("rc"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString File = Fixture.Root / TEXT("torn.txt");
+	FFileHelper::SaveStringToFile(TEXT("anchor content"), *File);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("torn.txt"), TEXT("first")));
+
+	FName Previous;
+	FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+	BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	// Simulate a crash mid-sync: the file differs from the anchor on disk, and a marker names it. The anchor never moved.
+	FFileHelper::SaveStringToFile(TEXT("half-written torn content"), *File);
+	FLoreOperationMarker Marker;
+	Marker.Kind = ELoreOperationKind::RevisionSync;
+	Marker.Instance = LorePluginStore::ReadInstanceId(Fixture.Root);
+	Marker.SourceBranch = TEXT("main");
+	Marker.ChangedFiles = { TEXT("torn.txt") };
+	Marker.Started = FDateTime::UtcNow();
+	TestTrue(TEXT("Marker write succeeds"), LoreOperationMarker::Write(Fixture.Root, Marker));
+
+	// Detection reads the marker for this instance and records a pending recovery.
+	Provider.DetectInterruptedRewrite();
+	TestTrue(TEXT("Detection records a pending recovery"), Provider.HasPendingRecovery());
+	TestEqual(TEXT("The pending recovery names the torn file"), Provider.GetPendingRecovery().ChangedFiles.Num(), 1);
+
+	// Recovery resets the torn file to the anchor, re-runs the sync, and clears the marker.
+	const bool bRecovered = Provider.PerformRecovery();
+	TestTrue(TEXT("Recovery succeeds"), bRecovered);
+	TestFalse(TEXT("The pending recovery is cleared"), Provider.HasPendingRecovery());
+	TestFalse(TEXT("The marker is gone after recovery"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+
+	FString Restored;
+	FFileHelper::LoadFileToString(Restored, *File);
+	TestEqual(TEXT("The torn file is restored to the anchor content"), Restored, FString(TEXT("anchor content")));
+
+	// A marker over a clean tree just clears: detection records it, recovery finds nothing dirty and removes it.
+	FFileHelper::SaveStringToFile(TEXT("anchor content"), *File);
+	FLoreOperationMarker CleanMarker = Marker;
+	TestTrue(TEXT("Clean-tree marker write succeeds"), LoreOperationMarker::Write(Fixture.Root, CleanMarker));
+	Provider.DetectInterruptedRewrite();
+	TestTrue(TEXT("Detection records the clean-tree marker"), Provider.HasPendingRecovery());
+	TestTrue(TEXT("Recovery over a clean tree succeeds"), Provider.PerformRecovery());
+	TestFalse(TEXT("The clean-tree marker is cleared"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+
+	// A marker whose instance differs from this tree is left alone.
+	FLoreOperationMarker OtherInstance = Marker;
+	OtherInstance.Instance = TEXT("some-other-instance");
+	// Write it directly to this instance's marker file so detection reads it, but with a foreign instance recorded.
+	TestTrue(TEXT("Foreign-instance marker write succeeds"), LoreOperationMarker::Write(Fixture.Root, OtherInstance));
+	Provider.DetectInterruptedRewrite();
+	TestFalse(TEXT("A marker from another instance is not adopted"), Provider.HasPendingRecovery());
+	LoreOperationMarker::Clear(Fixture.Root);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreInterruptedSwitchRecoveryTest, "LoreSourceControl.Recovery.SwitchReDispatchArm", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreInterruptedSwitchRecoveryTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreSwitchRecovery"), TEXT("swrc"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Seed main, then create and diverge feature so main and feature differ by this file. The tree ends on feature.
+	const FString File = Fixture.Root / TEXT("shared.txt");
+	FFileHelper::SaveStringToFile(TEXT("main content"), *File);
+	TestTrue(TEXT("Seed commit on main lands"), StageCommitPush(Fixture, TEXT("shared.txt"), TEXT("main-seed")));
+
+	TArray<FString> Errors;
+	TestTrue(TEXT("Feature create succeeds"), RunBranchCreate(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("feature"), FString(), Errors));
+	FFileHelper::SaveStringToFile(TEXT("feature content on the branch"), *File);
+	TestTrue(TEXT("Feature stages"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("shared.txt") }, Errors));
+	TestTrue(TEXT("Feature commits"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("feature-change"), Errors));
+
+	FString BranchNow;
+	GetBranchName(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, BranchNow);
+	TestEqual(TEXT("The tree is on feature before the interrupted switch"), BranchNow, FString(TEXT("feature")));
+
+	FName Previous;
+	FLoreSourceControlProvider& Provider = FLoreSourceControlModule::Get().GetProvider();
+	BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+	// The provider's cached branch is set by BeginProviderOn to main; the tree is really on feature, which is what a recovery from a torn switch back to main faces.
+
+	// Simulate a switch to main interrupted mid-rewrite: the shared file is half-written and a branchSwitch marker names main as the target.
+	FFileHelper::SaveStringToFile(TEXT("half-written torn during switch"), *File);
+	FLoreOperationMarker Marker;
+	Marker.Kind = ELoreOperationKind::BranchSwitch;
+	Marker.Instance = LorePluginStore::ReadInstanceId(Fixture.Root);
+	Marker.SourceBranch = TEXT("feature");
+	Marker.TargetBranch = TEXT("main");
+	Marker.ChangedFiles = { TEXT("shared.txt") };
+	Marker.Started = FDateTime::UtcNow();
+	TestTrue(TEXT("Switch marker write succeeds"), LoreOperationMarker::Write(Fixture.Root, Marker));
+
+	Provider.DetectInterruptedRewrite();
+	TestTrue(TEXT("Detection records a pending switch recovery"), Provider.HasPendingRecovery());
+	TestEqual(TEXT("The pending recovery names main as the target branch"), Provider.GetPendingRecovery().TargetBranch, FString(TEXT("main")));
+
+	// Recovery must reset the torn file, then choose the switch re-dispatch arm (target branch non-empty), landing the tree on main.
+	const bool bRecovered = Provider.PerformRecovery();
+	TestTrue(TEXT("Switch recovery succeeds"), bRecovered);
+	TestFalse(TEXT("The pending recovery is cleared"), Provider.HasPendingRecovery());
+	TestFalse(TEXT("The marker is gone after switch recovery"), LoreOperationMarker::Read(Fixture.Root).IsValid());
+
+	FString BranchAfter;
+	GetBranchName(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, BranchAfter);
+	TestEqual(TEXT("The switch re-dispatch landed the tree on main"), BranchAfter, FString(TEXT("main")));
+
+	FString OnDisk;
+	FFileHelper::LoadFileToString(OnDisk, *File);
+	TestEqual(TEXT("The file carries main's content after switch recovery"), OnDisk, FString(TEXT("main content")));
+
+	return true;
+}
+
 // Breadth: Lock -----------------------------------------------------------------
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreLockAcquireReleaseQueryTest, "LoreSourceControl.Lock.AcquireThenReleaseThenQuery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1705,6 +2300,149 @@ bool FLoreLockAcquireReleaseQueryTest::RunTest(const FString& Parameters)
 
 	TestTrue(TEXT("Release lock succeeds"), ReleaseLocks(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("lockme.uasset") }, Errors));
 	TestEqual(TEXT("After release the lock reads as NotLocked"), (int32)LockOf(), (int32)ELoreLockState::NotLocked);
+
+	return true;
+}
+
+// Breadth: Offline -------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreOfflineSkipsLockQueryTest, "LoreSourceControl.Offline.UpdateStatusSkipsLockQuery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreOfflineSkipsLockQueryTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreOfflineLock"), TEXT("ofl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("offline.uasset");
+	FFileHelper::SaveStringToFile(TEXT("offline content"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("offline.uasset"), TEXT("add offline")));
+
+	TArray<FString> Errors;
+	TestTrue(TEXT("Acquire lock succeeds"), AcquireLocks(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("offline.uasset") }, Errors));
+
+	// The command-line backend probes with a fresh process, so it detects a server drop reliably; the in-process native library reuses a cached connection, so its mid-session detection is unreliable and it covers the offline-at-connect case instead. The caller always passes the stale online hint, so a correct result proves the fresh probe, not the hint, drives the decision.
+	auto StatusState = [&]() -> FLoreSourceControlState
+	{
+		TArray<FLoreSourceControlState> States;
+		TArray<FString> StatusErrors;
+		RunUpdateStatus(ELoreBackendMode::CommandLine, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), true, { Asset }, StatusErrors, States, true);
+		return States.Num() == 1 ? States[0] : FLoreSourceControlState(Asset);
+	};
+
+	// Online, the status probe reports the remote reachable, the lock query runs, and the held lock shows.
+	const FLoreSourceControlState Online = StatusState();
+	TestTrue(TEXT("Online state records the remote as available"), Online.bRemoteAvailable);
+	TestEqual(TEXT("Online status reads the held lock"), (int32)Online.LockState, (int32)ELoreLockState::Locked);
+
+	// Take the server down mid-session. The status probe reports the remote unavailable in seconds, so the lock query (which would otherwise block for minutes) is skipped: the lock reads as not held and check out grays out.
+	Fixture.Server.Stop();
+	// Terminate does not wait, so let the process exit and free its socket before probing, or the probe catches a server still answering mid-shutdown.
+	FPlatformProcess::Sleep(2.0f);
+	const FLoreSourceControlState Offline = StatusState();
+	TestFalse(TEXT("Offline state records the remote as unavailable"), Offline.bRemoteAvailable);
+	TestEqual(TEXT("Offline status skips the lock query, lock reads NotLocked"), (int32)Offline.LockState, (int32)ELoreLockState::NotLocked);
+	TestFalse(TEXT("Offline check out is unavailable"), Offline.CanCheckout());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreOfflineCheckOutMakesWritableTest, "LoreSourceControl.Offline.CheckOutMakesWritable", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreOfflineCheckOutMakesWritableTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreOfflineCheckout"), TEXT("ofc"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const bool bWasLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+	FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(true);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetUsingLocking(bWasLocking); };
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("offcheck.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("offline checkout content"), *Asset);
+	const TArray<FString> AssetTargets = { Asset };
+
+	Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), AssetTargets, EConcurrency::Synchronous);
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> AddCheckIn = ISourceControlOperation::Create<FCheckIn>();
+	AddCheckIn->SetDescription(FText::FromString(TEXT("add offline asset")));
+	Provider.Execute(AddCheckIn, AssetTargets, EConcurrency::Synchronous);
+
+	// Locking left the committed binary asset read-only; confirm that starting state.
+	TestTrue(TEXT("Committed lockable asset is read-only before check out"), PlatformFile.IsReadOnly(*Asset));
+
+	// Force the offline state the command snapshots, then check out. The provider is a process-wide singleton, so restore reachability afterward or later tests inherit the offline path.
+	const bool bPrevAvailable = FLoreSourceControlModule::Get().GetProvider().IsRemoteAvailable();
+	const bool bPrevAuthorized = FLoreSourceControlModule::Get().GetProvider().IsRemoteAuthorized();
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().GetProvider().SetRemoteAuthState(bPrevAvailable, bPrevAuthorized); };
+	FLoreSourceControlModule::Get().GetProvider().SetRemoteAuthState(false, false);
+	const ECommandResult::Type Result = Provider.Execute(ISourceControlOperation::Create<FCheckOut>(), AssetTargets, EConcurrency::Synchronous);
+	TestEqual(TEXT("Offline check out succeeds without acquiring a lock"), (int32)Result, (int32)ECommandResult::Succeeded);
+	TestFalse(TEXT("Offline check out clears the read-only attribute"), PlatformFile.IsReadOnly(*Asset));
+
+	const FSourceControlStatePtr State = Provider.GetState(Asset, EStateCacheUsage::Use);
+	TestTrue(TEXT("State is valid after offline check out"), State.IsValid());
+	if (State.IsValid())
+	{
+		TestFalse(TEXT("Offline check out does not report a held lock"), State->IsCheckedOut());
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreOfflineProviderSelfHealTest, "LoreSourceControl.Offline.StatusUpdatesProviderReachability", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreOfflineProviderSelfHealTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreOfflineHeal"), TEXT("ofh"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("heal.uasset"));
+	FFileHelper::SaveStringToFile(TEXT("heal content"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("heal.uasset"), TEXT("add heal")));
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	FLoreSourceControlProvider& LoreProvider = FLoreSourceControlModule::Get().GetProvider();
+	const bool bPrevAvailable = LoreProvider.IsRemoteAvailable();
+	const bool bPrevAuthorized = LoreProvider.IsRemoteAuthorized();
+	ON_SCOPE_EXIT { LoreProvider.SetRemoteAuthState(bPrevAvailable, bPrevAuthorized); };
+
+	// The native library masks a mid-session drop behind its cached connection, so drive this through the command-line backend, whose fresh process detects the drop.
+	const ELoreBackendMode PrevBackend = FLoreSourceControlModule::Get().GetSettings().GetBackendMode();
+	FLoreSourceControlModule::Get().AccessSettings().SetBackendMode(ELoreBackendMode::CommandLine);
+	ON_SCOPE_EXIT { FLoreSourceControlModule::Get().AccessSettings().SetBackendMode(PrevBackend); };
+
+	const TArray<FString> Targets = { Asset };
+
+	// Recovery: start the provider marked offline, then a status pass against the reachable server restores it.
+	LoreProvider.SetRemoteAuthState(false, false);
+	Provider.Execute(ISourceControlOperation::Create<FUpdateStatus>(), Targets, EConcurrency::Synchronous);
+	TestTrue(TEXT("Status pass against a reachable server marks the provider available"), LoreProvider.IsRemoteAvailable());
+
+	// Drop: the server goes down, and the next status pass detects it so later commands gate on offline.
+	Fixture.Server.Stop();
+	// Terminate does not wait, so let the process exit and free its socket before probing.
+	FPlatformProcess::Sleep(2.0f);
+	Provider.Execute(ISourceControlOperation::Create<FUpdateStatus>(), Targets, EConcurrency::Synchronous);
+	TestFalse(TEXT("Status pass against a downed server marks the provider unavailable"), LoreProvider.IsRemoteAvailable());
 
 	return true;
 }
@@ -2088,6 +2826,1196 @@ bool FLoreContentObliteratedMarkedTest::RunTest(const FString& Parameters)
 
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreContentAvailableNotMarkedTest, "LoreSourceControl.Content.AvailableNotMarked", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreContentAvailableNotMarkedTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreContentAvail"), TEXT("cav"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	const FString Asset = Fixture.Root / TEXT("avail.txt");
+	FFileHelper::SaveStringToFile(TEXT("available content"), *Asset);
+	TestTrue(TEXT("Commit lands"), StageCommitPush(Fixture, TEXT("avail.txt"), TEXT("add avail")));
+
+	// The server is up, so the pushed content is fetchable from the remote even though the local store dropped the payload after the push. History must not mark it unavailable; this guards against the regression where every pushed revision read as unavailable.
+	TLoreSourceControlHistory History;
+	TArray<FString> Errors;
+	RunGetHistory(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Asset, Errors, History);
+	TestTrue(TEXT("History has a revision"), History.Num() >= 1);
+	if (History.Num() >= 1)
+	{
+		TestFalse(TEXT("Content available on the server is not marked unavailable"), History[0]->GetDescription().Contains(TEXT("[Unavailable]")));
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreBranchListTest, "LoreSourceControl.Branch.ListEnumeratesBranches", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreBranchListTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreBranchList"), TEXT("brl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// A branch is created from a revision, so seed one first.
+	const FString Asset = Fixture.Root / TEXT("seed.txt");
+	FFileHelper::SaveStringToFile(TEXT("seed"), *Asset);
+	TestTrue(TEXT("Seed commit lands"), StageCommitPush(Fixture, TEXT("seed.txt"), TEXT("seed")));
+
+	// The default branch enumerates as the current local branch.
+	TArray<LoreClient::FBranchInfo> Branches;
+	FString Error;
+	TestTrue(FString::Printf(TEXT("Branch list succeeds (err: %s)"), *Error), LoreClient::BranchList(Fixture.Root, false, Branches, Error));
+	const LoreClient::FBranchInfo* Main = Branches.FindByPredicate([](const LoreClient::FBranchInfo& B) { return B.Name == TEXT("main") && !B.bIsRemote; });
+	TestNotNull(TEXT("Local main branch is listed"), Main);
+	if (Main)
+	{
+		TestTrue(TEXT("Local main branch is current"), Main->bIsCurrent);
+		TestFalse(TEXT("Local main branch is not archived"), Main->bArchived);
+		TestFalse(TEXT("Local main branch latest hash is set"), Main->LatestHash.IsEmpty());
+	}
+
+	// A newly created branch appears in the listing.
+	TArray<FString> Results, Errors;
+	const bool bCreated = RunCommand(TEXT("branch create feature-x"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors);
+	TestTrue(TEXT("Branch create succeeds"), bCreated);
+
+	TArray<LoreClient::FBranchInfo> After;
+	TestTrue(TEXT("Branch list succeeds after create"), LoreClient::BranchList(Fixture.Root, false, After, Error));
+	const bool bHasFeature = After.ContainsByPredicate([](const LoreClient::FBranchInfo& B) { return B.Name == TEXT("feature-x") && !B.bIsRemote; });
+	TestTrue(TEXT("Newly created branch is listed"), bHasFeature);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreBranchProtectMetadataTest, "LoreSourceControl.Branch.ProtectMetadataRoundTrip", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreBranchProtectMetadataTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreBranchProtect"), TEXT("bpr"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// A branch needs a revision before it can be protected and pushed, so seed one.
+	const FString Asset = Fixture.Root / TEXT("seed.txt");
+	FFileHelper::SaveStringToFile(TEXT("seed"), *Asset);
+	TestTrue(TEXT("Seed commit lands"), StageCommitPush(Fixture, TEXT("seed.txt"), TEXT("seed")));
+
+	// The protect key is absent on a fresh branch.
+	FString Value;
+	bool bFound = false;
+	FString Error;
+	TestTrue(FString::Printf(TEXT("Metadata get succeeds on a fresh branch (err: %s)"), *Error), LoreClient::BranchMetadataGet(Fixture.Root, TEXT("main"), TEXT("protect"), Value, bFound, Error));
+	TestFalse(TEXT("A fresh branch has no protect key set to true"), bFound && Value == TEXT("true"));
+
+	// Protecting the branch sets the key to true.
+	TArray<FString> Results, Errors;
+	TestTrue(TEXT("Branch protect succeeds"), RunCommand(TEXT("branch protect main"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors));
+	Value.Empty(); bFound = false;
+	TestTrue(TEXT("Metadata get succeeds after protect"), LoreClient::BranchMetadataGet(Fixture.Root, TEXT("main"), TEXT("protect"), Value, bFound, Error));
+	TestTrue(TEXT("Protect key reads found after protect"), bFound);
+	TestEqual(TEXT("Protect key reads true after protect"), Value, FString(TEXT("true")));
+
+	// The native path and the command-line mirror agree on the protected key.
+	FString NativeValue, CommandLineValue;
+	bool bNativeFound = false, bCommandLineFound = false;
+	TArray<FString> NativeErrors, CommandLineErrors;
+	TestTrue(TEXT("Native metadata get succeeds"), RunBranchMetadataGet(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, TEXT("main"), TEXT("protect"), NativeValue, bNativeFound, NativeErrors));
+	TestTrue(TEXT("Command-line metadata get succeeds"), RunBranchMetadataGet(ELoreBackendMode::CommandLine, Fixture.Binary, Fixture.Root, TEXT("main"), TEXT("protect"), CommandLineValue, bCommandLineFound, CommandLineErrors));
+	TestEqual(TEXT("Backends agree the key is found"), bNativeFound, bCommandLineFound);
+	TestEqual(TEXT("Backends agree on the protect value"), NativeValue, CommandLineValue);
+	TestEqual(TEXT("Command-line mirror reads true"), CommandLineValue, FString(TEXT("true")));
+
+	// Unprotecting sets the key back to false.
+	TestTrue(TEXT("Branch unprotect succeeds"), RunCommand(TEXT("branch unprotect main"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors));
+	Value.Empty(); bFound = false;
+	TestTrue(TEXT("Metadata get succeeds after unprotect"), LoreClient::BranchMetadataGet(Fixture.Root, TEXT("main"), TEXT("protect"), Value, bFound, Error));
+	TestFalse(TEXT("Protect key does not read true after unprotect"), Value == TEXT("true"));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRevisionHistoryOrderAndPagingTest, "LoreSourceControl.Revision.HistoryOrderAndPaging", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRevisionHistoryOrderAndPagingTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreRevisionHistory"), TEXT("rvh"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Three known commits give the listing a known count, order, and messages.
+	const FString Asset = Fixture.Root / TEXT("page.txt");
+	FFileHelper::SaveStringToFile(TEXT("one"), *Asset);
+	TestTrue(TEXT("First commit lands"), StageCommitPush(Fixture, TEXT("page.txt"), TEXT("first page commit")));
+	FFileHelper::SaveStringToFile(TEXT("two"), *Asset);
+	TestTrue(TEXT("Second commit lands"), StageCommitPush(Fixture, TEXT("page.txt"), TEXT("second page commit")));
+	FFileHelper::SaveStringToFile(TEXT("three"), *Asset);
+	TestTrue(TEXT("Third commit lands"), StageCommitPush(Fixture, TEXT("page.txt"), TEXT("third page commit")));
+
+	TArray<LoreClient::FRevisionEntry> All;
+	FString Error;
+	TestTrue(FString::Printf(TEXT("Revision list succeeds (err: %s)"), *Error), LoreClient::RevisionList(Fixture.Root, FString(), FString(), 0, All, Error));
+	TestEqual(TEXT("Three fixture commits list three revisions"), All.Num(), 3);
+	if (All.Num() != 3)
+	{
+		return false;
+	}
+	TestEqual(TEXT("Listing is newest first"), All[0].RevisionNumber, 3);
+	TestEqual(TEXT("Middle entry is revision two"), All[1].RevisionNumber, 2);
+	TestEqual(TEXT("Oldest entry is revision one"), All[2].RevisionNumber, 1);
+	TestEqual(TEXT("Newest entry carries the newest message"), All[0].Message, FString(TEXT("third page commit")));
+	TestEqual(TEXT("Oldest entry carries the oldest message"), All[2].Message, FString(TEXT("first page commit")));
+	TestEqual(TEXT("Newest entry names the fixture author"), All[0].Author, FString(TEXT("test@example.com")));
+	TestEqual(TEXT("Newest entry chains to the middle entry"), All[0].ParentHash, All[1].Hash);
+	TestEqual(TEXT("Middle entry chains to the oldest entry"), All[1].ParentHash, All[2].Hash);
+
+	// The start revision is included in its page, so the next page starts at the oldest loaded entry's parent and the pages meet with no overlap.
+	TArray<LoreClient::FRevisionEntry> PageOne;
+	TestTrue(TEXT("First page succeeds"), LoreClient::RevisionList(Fixture.Root, FString(), FString(), 2, PageOne, Error));
+	TestEqual(TEXT("First page holds exactly the page length"), PageOne.Num(), 2);
+	if (PageOne.Num() == 2)
+	{
+		TestEqual(TEXT("First page starts at the tip"), PageOne[0].Hash, All[0].Hash);
+		TArray<LoreClient::FRevisionEntry> PageTwo;
+		TestTrue(TEXT("Second page succeeds"), LoreClient::RevisionList(Fixture.Root, FString(), PageOne.Last().ParentHash, 2, PageTwo, Error));
+		TestEqual(TEXT("Second page holds the one remaining revision"), PageTwo.Num(), 1);
+		if (PageTwo.Num() == 1)
+		{
+			TestEqual(TEXT("Pages meet exactly"), PageTwo[0].Hash, All[2].Hash);
+			TestNotEqual(TEXT("Pages do not repeat the boundary revision"), PageTwo[0].Hash, PageOne.Last().Hash);
+		}
+	}
+
+	// The native path and the command-line mirror agree entry for entry.
+	TArray<FLoreRevisionListEntry> NativeList, CommandLineList;
+	TArray<FString> NativeErrors, CommandLineErrors;
+	TestTrue(TEXT("Native revision list succeeds"), RunRevisionList(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, FString(), FString(), 0, NativeList, NativeErrors));
+	TestTrue(TEXT("Command-line revision list succeeds"), RunRevisionList(ELoreBackendMode::CommandLine, Fixture.Binary, Fixture.Root, FString(), FString(), 0, CommandLineList, CommandLineErrors));
+	TestEqual(TEXT("Backends agree on revision count"), NativeList.Num(), CommandLineList.Num());
+	for (int32 Index = 0; Index < FMath::Min(NativeList.Num(), CommandLineList.Num()); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("Backends agree on hash %d"), Index), NativeList[Index].Hash, CommandLineList[Index].Hash);
+		TestEqual(*FString::Printf(TEXT("Backends agree on number %d"), Index), NativeList[Index].RevisionNumber, CommandLineList[Index].RevisionNumber);
+		TestEqual(*FString::Printf(TEXT("Backends agree on parent %d"), Index), NativeList[Index].ParentHash, CommandLineList[Index].ParentHash);
+		TestEqual(*FString::Printf(TEXT("Backends agree on merge parent %d"), Index), NativeList[Index].ParentOtherHash, CommandLineList[Index].ParentOtherHash);
+		TestTrue(*FString::Printf(TEXT("Backends agree on date %d"), Index), NativeList[Index].Date == CommandLineList[Index].Date);
+		TestEqual(*FString::Printf(TEXT("Backends agree on message %d"), Index), NativeList[Index].Message, CommandLineList[Index].Message);
+		TestEqual(*FString::Printf(TEXT("Backends agree on author %d"), Index), NativeList[Index].Author, CommandLineList[Index].Author);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreRevisionInfoMetadataAndDeltaTest, "LoreSourceControl.Revision.InfoMetadataAndDelta", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreRevisionInfoMetadataAndDeltaTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreRevisionInfo"), TEXT("rvi"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// First commit adds two files; the second edits one, so each revision has a known delta.
+	const FString Alpha = Fixture.Root / TEXT("alpha.txt");
+	const FString Beta = Fixture.Root / TEXT("beta.txt");
+	FFileHelper::SaveStringToFile(TEXT("alpha one"), *Alpha);
+	FFileHelper::SaveStringToFile(TEXT("beta one"), *Beta);
+	TArray<FString> Errors;
+	TestTrue(TEXT("Both files stage"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("alpha.txt"), TEXT("beta.txt") }, Errors));
+	TestTrue(TEXT("First commit lands"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("add alpha and beta"), Errors));
+	TestTrue(TEXT("First push lands"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Errors));
+
+	FFileHelper::SaveStringToFile(TEXT("alpha two"), *Alpha);
+	TestTrue(TEXT("Second commit lands"), StageCommitPush(Fixture, TEXT("alpha.txt"), TEXT("edit alpha")));
+
+	TArray<LoreClient::FRevisionEntry> Revisions;
+	FString Error;
+	TestTrue(TEXT("Revision list succeeds"), LoreClient::RevisionList(Fixture.Root, FString(), FString(), 0, Revisions, Error));
+	TestEqual(TEXT("Two fixture commits list two revisions"), Revisions.Num(), 2);
+	if (Revisions.Num() != 2)
+	{
+		return false;
+	}
+
+	// Metadata of the newest revision matches what the fixture committed.
+	LoreClient::FRevisionDetails Newest;
+	TestTrue(FString::Printf(TEXT("Revision info succeeds (err: %s)"), *Error), LoreClient::RevisionInfo(Fixture.Root, Revisions[0].Hash, true, Newest, Error));
+	TestEqual(TEXT("Info reports the queried hash"), Newest.Hash, Revisions[0].Hash);
+	TestEqual(TEXT("Info reports the revision number"), Newest.RevisionNumber, 2);
+	TestEqual(TEXT("Message matches the fixture commit"), Newest.Message, FString(TEXT("edit alpha")));
+	TestEqual(TEXT("Author matches the fixture identity"), Newest.Author, FString(TEXT("test@example.com")));
+	TestTrue(TEXT("Timestamp is set"), Newest.Date > FDateTime(2020, 1, 1));
+
+	// The edit delta names exactly the one edited file, a keep flagged modified.
+	TArray<LoreClient::FRevisionDelta> NewestFiles;
+	for (const LoreClient::FRevisionDelta& Delta : Newest.Deltas)
+	{
+		if (Delta.bIsFile)
+		{
+			NewestFiles.Add(Delta);
+		}
+	}
+	TestEqual(TEXT("Edit delta holds exactly one file"), NewestFiles.Num(), 1);
+	if (NewestFiles.Num() == 1)
+	{
+		TestEqual(TEXT("Edit delta names the edited file"), NewestFiles[0].Path, FString(TEXT("alpha.txt")));
+		TestEqual(TEXT("Edited file keeps its identity"), NewestFiles[0].Action, FString(TEXT("keep")));
+		TestTrue(TEXT("Edited file is flagged modified"), NewestFiles[0].bModified);
+		TestTrue(TEXT("Edited file carries its size"), NewestFiles[0].Size > 0);
+	}
+
+	// The first revision's delta names exactly the two added files.
+	LoreClient::FRevisionDetails Oldest;
+	TestTrue(TEXT("Info of the first revision succeeds"), LoreClient::RevisionInfo(Fixture.Root, Revisions[1].Hash, true, Oldest, Error));
+	TArray<FString> OldestFiles;
+	for (const LoreClient::FRevisionDelta& Delta : Oldest.Deltas)
+	{
+		if (Delta.bIsFile)
+		{
+			OldestFiles.Add(Delta.Path);
+			TestEqual(TEXT("Added file action is add"), Delta.Action, FString(TEXT("add")));
+		}
+	}
+	OldestFiles.Sort();
+	TestEqual(TEXT("Add delta holds exactly two files"), OldestFiles.Num(), 2);
+	if (OldestFiles.Num() == 2)
+	{
+		TestEqual(TEXT("Add delta names alpha"), OldestFiles[0], FString(TEXT("alpha.txt")));
+		TestEqual(TEXT("Add delta names beta"), OldestFiles[1], FString(TEXT("beta.txt")));
+	}
+
+	// The native path and the command-line mirror agree on metadata and delta.
+	FLoreRevisionDetails NativeDetails, CommandLineDetails;
+	TArray<FString> NativeErrors, CommandLineErrors;
+	TestTrue(TEXT("Native revision info succeeds"), RunRevisionInfo(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, Revisions[0].Hash, true, NativeDetails, NativeErrors));
+	TestTrue(TEXT("Command-line revision info succeeds"), RunRevisionInfo(ELoreBackendMode::CommandLine, Fixture.Binary, Fixture.Root, Revisions[0].Hash, true, CommandLineDetails, CommandLineErrors));
+	TestEqual(TEXT("Backends agree on the hash"), NativeDetails.Hash, CommandLineDetails.Hash);
+	TestEqual(TEXT("Backends agree on the number"), NativeDetails.RevisionNumber, CommandLineDetails.RevisionNumber);
+	TestEqual(TEXT("Backends agree on the message"), NativeDetails.Message, CommandLineDetails.Message);
+	TestEqual(TEXT("Backends agree on the author"), NativeDetails.Author, CommandLineDetails.Author);
+	TestTrue(TEXT("Backends agree on the date"), NativeDetails.Date == CommandLineDetails.Date);
+	TestEqual(TEXT("Backends agree on delta count"), NativeDetails.Deltas.Num(), CommandLineDetails.Deltas.Num());
+	for (int32 Index = 0; Index < FMath::Min(NativeDetails.Deltas.Num(), CommandLineDetails.Deltas.Num()); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("Backends agree on delta path %d"), Index), NativeDetails.Deltas[Index].Path, CommandLineDetails.Deltas[Index].Path);
+		TestEqual(*FString::Printf(TEXT("Backends agree on delta action %d"), Index), NativeDetails.Deltas[Index].Action, CommandLineDetails.Deltas[Index].Action);
+		TestTrue(*FString::Printf(TEXT("Backends agree on delta size %d"), Index), NativeDetails.Deltas[Index].Size == CommandLineDetails.Deltas[Index].Size);
+		TestTrue(*FString::Printf(TEXT("Backends agree on delta flags %d"), Index), NativeDetails.Deltas[Index].bModified == CommandLineDetails.Deltas[Index].bModified && NativeDetails.Deltas[Index].bMerged == CommandLineDetails.Deltas[Index].bMerged && NativeDetails.Deltas[Index].bIsFile == CommandLineDetails.Deltas[Index].bIsFile);
+	}
+
+	return true;
+}
 #endif // LORE_WITH_LIBLORE
+
+// Branch item merge is a pure function, so it runs on every engine with no server.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreBranchMergeTest, "LoreSourceControl.Branch.MergeFoldsLocalAndRemote", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreBranchMergeTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	auto MakeEntry = [](const TCHAR* Name, bool bRemote, const TCHAR* Latest, bool bCurrent, bool bArchived)
+	{
+		FLoreBranchItem E;
+		E.Name = Name;
+		E.bHasLocal = !bRemote;
+		E.bHasRemote = bRemote;
+		if (bRemote) { E.LatestRemote = Latest; } else { E.LatestLocal = Latest; }
+		E.bIsCurrent = bCurrent;
+		E.bArchived = bArchived;
+		return E;
+	};
+
+	// A local-only, a remote-only, a branch in both that agrees, a branch in both that diverges, and an archived local-only branch with a blank latest.
+	TArray<FLoreBranchItem> Entries;
+	Entries.Add(MakeEntry(TEXT("local-only"), false, TEXT("aaaa"), false, false));
+	Entries.Add(MakeEntry(TEXT("remote-only"), true, TEXT("bbbb"), false, false));
+	Entries.Add(MakeEntry(TEXT("both-agree"), false, TEXT("cccc"), true, false));
+	Entries.Add(MakeEntry(TEXT("both-agree"), true, TEXT("cccc"), false, false));
+	Entries.Add(MakeEntry(TEXT("both-diverge"), false, TEXT("dddd"), false, false));
+	Entries.Add(MakeEntry(TEXT("both-diverge"), true, TEXT("eeee"), false, false));
+	Entries.Add(MakeEntry(TEXT("archived-branch"), false, TEXT(""), false, true));
+
+	TArray<FLoreBranchItem> Merged;
+	MergeBranchListEntries(Entries, Merged);
+
+	TestEqual(TEXT("Five distinct names fold to five rows"), Merged.Num(), 5);
+
+	auto Find = [&Merged](const TCHAR* Name) -> const FLoreBranchItem*
+	{
+		return Merged.FindByPredicate([Name](const FLoreBranchItem& R) { return R.Name == Name; });
+	};
+
+	const FLoreBranchItem* LocalOnly = Find(TEXT("local-only"));
+	TestNotNull(TEXT("Local-only row exists"), LocalOnly);
+	if (LocalOnly)
+	{
+		TestTrue(TEXT("Local-only has local"), LocalOnly->bHasLocal);
+		TestFalse(TEXT("Local-only has no remote"), LocalOnly->bHasRemote);
+	}
+
+	const FLoreBranchItem* RemoteOnly = Find(TEXT("remote-only"));
+	TestNotNull(TEXT("Remote-only row exists"), RemoteOnly);
+	if (RemoteOnly)
+	{
+		TestFalse(TEXT("Remote-only has no local"), RemoteOnly->bHasLocal);
+		TestTrue(TEXT("Remote-only has remote"), RemoteOnly->bHasRemote);
+	}
+
+	const FLoreBranchItem* Both = Find(TEXT("both-agree"));
+	TestNotNull(TEXT("Both-agree row exists"), Both);
+	if (Both)
+	{
+		TestTrue(TEXT("Both-agree has local and remote"), Both->bHasLocal && Both->bHasRemote);
+		TestTrue(TEXT("Both-agree keeps the local current flag"), Both->bIsCurrent);
+		TestEqual(TEXT("Both-agree local and remote latest match"), Both->LatestLocal, Both->LatestRemote);
+	}
+
+	const FLoreBranchItem* Diverge = Find(TEXT("both-diverge"));
+	TestNotNull(TEXT("Both-diverge row exists"), Diverge);
+	if (Diverge)
+	{
+		TestTrue(TEXT("Both-diverge has local and remote"), Diverge->bHasLocal && Diverge->bHasRemote);
+		TestNotEqual(TEXT("Both-diverge latest hashes differ"), Diverge->LatestLocal, Diverge->LatestRemote);
+	}
+
+	const FLoreBranchItem* Archived = Find(TEXT("archived-branch"));
+	TestNotNull(TEXT("Archived row exists"), Archived);
+	if (Archived)
+	{
+		TestTrue(TEXT("Archived is local-only"), Archived->bHasLocal && !Archived->bHasRemote);
+		TestTrue(TEXT("Archived is flagged archived"), Archived->bArchived);
+		TestTrue(TEXT("Archived renders a blank latest"), Archived->LatestLocal.IsEmpty());
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreGetBranchesReadTest, "LoreSourceControl.Branch.GetBranchesReadsRowsAndProtect", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreGetBranchesReadTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreGetBranches"), TEXT("gbr"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Seed a revision so branches have a latest, then create a second branch and protect main.
+	const FString Asset = Fixture.Root / TEXT("seed.txt");
+	FFileHelper::SaveStringToFile(TEXT("seed"), *Asset);
+	TestTrue(TEXT("Seed commit lands"), StageCommitPush(Fixture, TEXT("seed.txt"), TEXT("seed")));
+
+	TArray<FString> Results, Errors;
+	TestTrue(TEXT("Branch create succeeds"), RunCommand(TEXT("branch create feature-y"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors));
+	// Creating feature-y switched to it; switch back so main reads current, then protect main.
+	TestTrue(TEXT("Switch back to main succeeds"), RunCommand(TEXT("branch switch main"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors));
+	TestTrue(TEXT("Branch protect main succeeds"), RunCommand(TEXT("branch protect main"), Fixture.Binary, Fixture.Root, TArray<FString>(), TArray<FString>(), Results, Errors));
+
+	TArray<FLoreBranchItem> Branches;
+	TArray<FString> ReadErrors;
+	TestTrue(TEXT("GetBranches succeeds"), RunGetBranches(ELoreBackendMode::Native, Fixture.Binary, Fixture.Root, false, Branches, ReadErrors));
+
+	const FLoreBranchItem* Main = Branches.FindByPredicate([](const FLoreBranchItem& B) { return B.Name == TEXT("main"); });
+	TestNotNull(TEXT("main is enumerated"), Main);
+	if (Main)
+	{
+		TestTrue(TEXT("main is the current branch"), Main->bIsCurrent);
+		TestTrue(TEXT("main reads a local latest"), !Main->LatestLocal.IsEmpty());
+		TestTrue(TEXT("main reads protected after protect"), Main->bProtected);
+	}
+
+	const FLoreBranchItem* Feature = Branches.FindByPredicate([](const FLoreBranchItem& B) { return B.Name == TEXT("feature-y"); });
+	TestNotNull(TEXT("feature-y is enumerated"), Feature);
+	if (Feature)
+	{
+		TestFalse(TEXT("feature-y is not the current branch"), Feature->bIsCurrent);
+		TestFalse(TEXT("feature-y is not protected"), Feature->bProtected);
+	}
+
+	return true;
+}
+
+// The read operations dispatch through the provider and carry their rows on the operation object.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreReadOperationsProviderTest, "LoreSourceControl.Branch.ReadOperationsThroughProvider", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreReadOperationsProviderTest::RunTest(const FString& Parameters)
+{
+	using namespace LoreSourceControlUtils;
+
+	FLoreTestFixture Fixture(*this, TEXT("LoreReadOps"), TEXT("rdo"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Two commits: the first adds two files, the second edits one, so the delta of each revision is known.
+	const FString Alpha = Fixture.Root / TEXT("alpha.txt");
+	const FString Beta = Fixture.Root / TEXT("beta.txt");
+	FFileHelper::SaveStringToFile(TEXT("alpha one"), *Alpha);
+	FFileHelper::SaveStringToFile(TEXT("beta one"), *Beta);
+	TArray<FString> Errors;
+	TestTrue(TEXT("Both files stage"), StageFiles(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, { TEXT("alpha.txt"), TEXT("beta.txt") }, Errors));
+	TestTrue(TEXT("First commit lands"), CommitChanges(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, TEXT("test@example.com"), TEXT("add alpha and beta"), Errors));
+	TestTrue(TEXT("First push lands"), PushBranch(ELoreBackendMode::Automatic, Fixture.Binary, Fixture.Root, Errors));
+	FFileHelper::SaveStringToFile(TEXT("alpha two"), *Alpha);
+	TestTrue(TEXT("Second commit lands"), StageCommitPush(Fixture, TEXT("alpha.txt"), TEXT("edit alpha")));
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	// GetBranches enumerates main as the current branch.
+	const TArray<FString> NoFiles;
+	TSharedRef<FLoreGetBranches, ESPMode::ThreadSafe> BranchesOp = ISourceControlOperation::Create<FLoreGetBranches>();
+	const ECommandResult::Type BranchesResult = Provider.Execute(BranchesOp, NoFiles, EConcurrency::Synchronous);
+	TestEqual(TEXT("GetBranches through the provider succeeds"), (int32)BranchesResult, (int32)ECommandResult::Succeeded);
+	const FLoreBranchItem* Main = BranchesOp->Branches.FindByPredicate([](const FLoreBranchItem& B) { return B.Name == TEXT("main"); });
+	TestNotNull(TEXT("GetBranches lists main"), Main);
+	if (Main)
+	{
+		TestTrue(TEXT("GetBranches flags main current"), Main->bIsCurrent);
+	}
+
+	// GetRevisions returns the two fixture commits newest first.
+	TSharedRef<FLoreGetRevisions, ESPMode::ThreadSafe> RevisionsOp = ISourceControlOperation::Create<FLoreGetRevisions>();
+	const ECommandResult::Type RevisionsResult = Provider.Execute(RevisionsOp, NoFiles, EConcurrency::Synchronous);
+	TestEqual(TEXT("GetRevisions through the provider succeeds"), (int32)RevisionsResult, (int32)ECommandResult::Succeeded);
+	TestEqual(TEXT("GetRevisions returns two revisions"), RevisionsOp->Revisions.Num(), 2);
+	if (RevisionsOp->Revisions.Num() == 2)
+	{
+		TestEqual(TEXT("GetRevisions is newest first"), RevisionsOp->Revisions[0].RevisionNumber, 2);
+		TestEqual(TEXT("GetRevisions oldest carries the first message"), RevisionsOp->Revisions[1].Message, FString(TEXT("add alpha and beta")));
+
+		// GetRevisionFiles on the newest revision names exactly the edited file, filtered to files.
+		TSharedRef<FLoreGetRevisionFiles, ESPMode::ThreadSafe> FilesOp = ISourceControlOperation::Create<FLoreGetRevisionFiles>();
+		FilesOp->Revision = RevisionsOp->Revisions[0].Hash;
+		const ECommandResult::Type FilesResult = Provider.Execute(FilesOp, NoFiles, EConcurrency::Synchronous);
+		TestEqual(TEXT("GetRevisionFiles through the provider succeeds"), (int32)FilesResult, (int32)ECommandResult::Succeeded);
+		TArray<FString> Changed;
+		FString ChangedAction;
+		for (const FLoreRevisionDeltaEntry& Delta : FilesOp->Details.Deltas)
+		{
+			if (Delta.bIsFile)
+			{
+				Changed.Add(Delta.Path);
+				ChangedAction = Delta.Action;
+			}
+		}
+		TestEqual(TEXT("GetRevisionFiles names exactly one changed file"), Changed.Num(), 1);
+		if (Changed.Num() == 1)
+		{
+			TestEqual(TEXT("GetRevisionFiles names the edited file"), Changed[0], FString(TEXT("alpha.txt")));
+			TestEqual(TEXT("An edit reads action keep with modify"), ChangedAction, FString(TEXT("keep")));
+		}
+	}
+
+	return true;
+}
+
+// Breadth: Plugin store --------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLorePluginStoreRoundTripTest, "LoreSourceControl.Store.JsonRoundTrip", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLorePluginStoreRoundTripTest::RunTest(const FString& Parameters)
+{
+	// A throwaway working-tree root; the store is local, so no server is needed.
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreStoreTest"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	const FString Path = LorePluginStore::GetStorePath(Root, TEXT("changelists/test.json"));
+
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("title"), TEXT("Work in progress"));
+	Object->SetNumberField(TEXT("version"), 1);
+	TArray<TSharedPtr<FJsonValue>> Files;
+	Files.Add(MakeShared<FJsonValueString>(TEXT("Content/A.uasset")));
+	Object->SetArrayField(TEXT("files"), Files);
+
+	TestTrue(TEXT("Atomic write succeeds"), LorePluginStore::WriteJsonObjectAtomic(Path, Object));
+	TestTrue(TEXT("Store file lands under the plugin store"), IFileManager::Get().FileExists(*Path) && Path.Contains(TEXT("ueplugin")));
+
+	TSharedPtr<FJsonObject> ReadBack;
+	TestTrue(TEXT("Read back succeeds"), LorePluginStore::ReadJsonObject(Path, ReadBack));
+	if (ReadBack.IsValid())
+	{
+		TestEqual(TEXT("Title round-trips"), ReadBack->GetStringField(TEXT("title")), FString(TEXT("Work in progress")));
+		TestEqual(TEXT("File list round-trips"), ReadBack->GetArrayField(TEXT("files")).Num(), 1);
+	}
+
+	// A second write replaces the first in one step.
+	Object->SetStringField(TEXT("title"), TEXT("Updated"));
+	TestTrue(TEXT("Second atomic write succeeds"), LorePluginStore::WriteJsonObjectAtomic(Path, Object));
+	TSharedPtr<FJsonObject> ReadBack2;
+	LorePluginStore::ReadJsonObject(Path, ReadBack2);
+	TestEqual(TEXT("Updated title round-trips"), ReadBack2.IsValid() ? ReadBack2->GetStringField(TEXT("title")) : FString(), FString(TEXT("Updated")));
+
+	// No temporary files survive an atomic write.
+	TArray<FString> Leftover;
+	IFileManager::Get().FindFiles(Leftover, *(LorePluginStore::GetStorePath(Root, TEXT("changelists")) / TEXT("*.tmp")), true, false);
+	TestEqual(TEXT("No temporary files remain after atomic writes"), Leftover.Num(), 0);
+
+	// Reading an absent file fails rather than asserting.
+	TSharedPtr<FJsonObject> Missing;
+	TestFalse(TEXT("Reading an absent store file returns false"), LorePluginStore::ReadJsonObject(LorePluginStore::GetStorePath(Root, TEXT("changelists/absent.json")), Missing));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistStoreRoundTripTest, "LoreSourceControl.Store.ChangelistRoundTrip", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistStoreRoundTripTest::RunTest(const FString& Parameters)
+{
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreChangelistTest"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	// With no store file, Load yields only the mandatory Default changelist.
+	TArray<FLoreChangelistRecord> Initial = LoreChangelists::Load(Root);
+	TestEqual(TEXT("A fresh tree has one changelist"), Initial.Num(), 1);
+	TestTrue(TEXT("The sole changelist is Default"), Initial.Num() == 1 && Initial[0].IsDefault());
+
+	// Add a named changelist and persist.
+	FLoreChangelistRecord Feature;
+	Feature.Id = TEXT("cl-1");
+	Feature.Title = TEXT("Lighting pass");
+	Feature.Description = TEXT("Rebake the hero level lighting");
+	Feature.Author = TEXT("test@example.com");
+	Feature.Files = { TEXT("Content/Maps/Hero.umap"), TEXT("Content/Light.uasset") };
+	Initial.Add(Feature);
+	TestTrue(TEXT("Save succeeds"), LoreChangelists::Save(Root, Initial));
+
+	// Reload and assert the round-trip.
+	TArray<FLoreChangelistRecord> Reloaded = LoreChangelists::Load(Root);
+	TestEqual(TEXT("Reload returns Default plus the named changelist"), Reloaded.Num(), 2);
+	const FLoreChangelistRecord* Found = Reloaded.FindByPredicate([](const FLoreChangelistRecord& R) { return R.Id == TEXT("cl-1"); });
+	TestNotNull(TEXT("The named changelist reloads"), Found);
+	if (Found)
+	{
+		TestEqual(TEXT("Title round-trips"), Found->Title, FString(TEXT("Lighting pass")));
+		TestEqual(TEXT("Description round-trips"), Found->Description, FString(TEXT("Rebake the hero level lighting")));
+		TestEqual(TEXT("File list round-trips"), Found->Files.Num(), 2);
+		TestFalse(TEXT("The named changelist is not Default"), Found->IsDefault());
+	}
+	TestTrue(TEXT("Default remains and is first"), Reloaded.Num() >= 1 && Reloaded[0].IsDefault());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistReconcileTest, "LoreSourceControl.Store.ChangelistReconcile", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistReconcileTest::RunTest(const FString& Parameters)
+{
+	auto MakeSet = []()
+	{
+		TArray<FLoreChangelistRecord> Records;
+		FLoreChangelistRecord Default; Default.Id = LoreChangelists::DefaultId; Default.Title = TEXT("Default");
+		FLoreChangelistRecord Feature; Feature.Id = TEXT("cl-1"); Feature.Title = TEXT("Feature"); Feature.Files = { TEXT("A.uasset") };
+		Records.Add(Default);
+		Records.Add(Feature);
+		return Records;
+	};
+
+	auto FilesOf = [](const TArray<FLoreChangelistRecord>& Records, const FString& Id) -> TArray<FString>
+	{
+		const FLoreChangelistRecord* R = Records.FindByPredicate([&Id](const FLoreChangelistRecord& X) { return X.Id == Id; });
+		return R ? R->Files : TArray<FString>();
+	};
+
+	// A new changed file joins Default; an already-assigned file stays in its changelist and is not duplicated.
+	{
+		TArray<FLoreChangelistRecord> Records = MakeSet();
+		LoreChangelists::Reconcile(Records, { TEXT("A.uasset"), TEXT("B.uasset") }, TMap<FString, FString>());
+		TestTrue(TEXT("Assigned file stays in its changelist"), FilesOf(Records, TEXT("cl-1")).Contains(TEXT("A.uasset")));
+		TestTrue(TEXT("Unassigned changed file joins Default"), FilesOf(Records, LoreChangelists::DefaultId).Contains(TEXT("B.uasset")));
+		TestFalse(TEXT("Assigned file is not duplicated into Default"), FilesOf(Records, LoreChangelists::DefaultId).Contains(TEXT("A.uasset")));
+	}
+
+	// A file no longer changed is dropped, and its now-empty non-Default changelist survives.
+	{
+		TArray<FLoreChangelistRecord> Records = MakeSet();
+		LoreChangelists::Reconcile(Records, { TEXT("B.uasset") }, TMap<FString, FString>());
+		TestFalse(TEXT("Unchanged file is dropped from its changelist"), FilesOf(Records, TEXT("cl-1")).Contains(TEXT("A.uasset")));
+		TestTrue(TEXT("The now-empty changelist survives"), Records.ContainsByPredicate([](const FLoreChangelistRecord& R) { return R.Id == TEXT("cl-1"); }));
+	}
+
+	// A moved file keeps its changelist under the new path.
+	{
+		TArray<FLoreChangelistRecord> Records = MakeSet();
+		TMap<FString, FString> Moves;
+		Moves.Add(TEXT("A.uasset"), TEXT("C.uasset"));
+		LoreChangelists::Reconcile(Records, { TEXT("C.uasset") }, Moves);
+		TestTrue(TEXT("Moved file follows its new path"), FilesOf(Records, TEXT("cl-1")).Contains(TEXT("C.uasset")));
+		TestFalse(TEXT("Old path is gone from the changelist"), FilesOf(Records, TEXT("cl-1")).Contains(TEXT("A.uasset")));
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistConcurrentMutateTest, "LoreSourceControl.Store.ChangelistConcurrentMutate", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistConcurrentMutateTest::RunTest(const FString& Parameters)
+{
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreChangelistConcurrent"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	// Seed a named changelist for the pool task to edit while this thread edits Default.
+	TestTrue(TEXT("Seed mutate succeeds"), LoreChangelists::Mutate(Root, [](TArray<FLoreChangelistRecord>& Records)
+	{
+		FLoreChangelistRecord Feature;
+		Feature.Id = TEXT("cl-1");
+		Feature.Title = TEXT("Feature");
+		Records.Add(Feature);
+		return true;
+	}));
+
+	// Interleave a few hundred load-edit-save cycles from a pool thread and this thread, the changelist-worker-versus-GetState race. Every edit must survive; an unguarded read-modify-write loses whichever save lands in between.
+	constexpr int32 EditsPerSide = 200;
+	TFuture<void> PoolEdits = Async(EAsyncExecution::ThreadPool, [&Root, EditsPerSide]()
+	{
+		for (int32 Index = 0; Index < EditsPerSide; ++Index)
+		{
+			LoreChangelists::Mutate(Root, [Index](TArray<FLoreChangelistRecord>& Records)
+			{
+				Records.FindByPredicate([](const FLoreChangelistRecord& R) { return R.Id == TEXT("cl-1"); })->Files.Add(FString::Printf(TEXT("Pool/%d.uasset"), Index));
+				return true;
+			});
+		}
+	});
+	for (int32 Index = 0; Index < EditsPerSide; ++Index)
+	{
+		LoreChangelists::Mutate(Root, [Index](TArray<FLoreChangelistRecord>& Records)
+		{
+			Records.FindByPredicate([](const FLoreChangelistRecord& R) { return R.IsDefault(); })->Files.Add(FString::Printf(TEXT("Game/%d.uasset"), Index));
+			return true;
+		});
+	}
+	PoolEdits.Wait();
+
+	const TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Root);
+	const FLoreChangelistRecord* Default = Records.FindByPredicate([](const FLoreChangelistRecord& R) { return R.IsDefault(); });
+	const FLoreChangelistRecord* Feature = Records.FindByPredicate([](const FLoreChangelistRecord& R) { return R.Id == TEXT("cl-1"); });
+	TestEqual(TEXT("No game-thread edit is lost"), Default ? Default->Files.Num() : 0, EditsPerSide);
+	TestEqual(TEXT("No pool-thread edit is lost"), Feature ? Feature->Files.Num() : 0, EditsPerSide);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreOperationMarkerTest, "LoreSourceControl.Store.OperationMarker", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreOperationMarkerTest::RunTest(const FString& Parameters)
+{
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreMarkerTest"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	// With no marker, a read reports no operation in progress.
+	TestFalse(TEXT("A fresh tree has no operation marker"), LoreOperationMarker::Read(Root).IsValid());
+
+	// Write a marker for an interrupted branch switch and read it back.
+	FLoreOperationMarker Marker;
+	Marker.Kind = ELoreOperationKind::BranchSwitch;
+	Marker.Instance = TEXT("deadbeef");
+	Marker.SourceBranch = TEXT("main");
+	Marker.TargetBranch = TEXT("feature-one");
+	Marker.SourceRevision = TEXT("aaaa");
+	Marker.TargetRevision = TEXT("bbbb");
+	Marker.ChangedFiles = { TEXT("Content/A.uasset"), TEXT("Content/B.uasset") };
+	TestTrue(TEXT("Marker write succeeds"), LoreOperationMarker::Write(Root, Marker));
+
+	const FLoreOperationMarker ReadBack = LoreOperationMarker::Read(Root);
+	TestTrue(TEXT("A written marker reads as a pending operation"), ReadBack.IsValid());
+	TestEqual(TEXT("Marker kind round-trips"), (int32)ReadBack.Kind, (int32)ELoreOperationKind::BranchSwitch);
+	TestEqual(TEXT("Instance round-trips"), ReadBack.Instance, FString(TEXT("deadbeef")));
+	TestEqual(TEXT("Source branch round-trips"), ReadBack.SourceBranch, FString(TEXT("main")));
+	TestEqual(TEXT("Target branch round-trips"), ReadBack.TargetBranch, FString(TEXT("feature-one")));
+	TestEqual(TEXT("Source revision round-trips"), ReadBack.SourceRevision, FString(TEXT("aaaa")));
+	TestEqual(TEXT("Target revision round-trips"), ReadBack.TargetRevision, FString(TEXT("bbbb")));
+	TestEqual(TEXT("Changed file set round-trips"), ReadBack.ChangedFiles.Num(), 2);
+
+	// Clearing removes the marker, so a later connect sees no interrupted operation.
+	TestTrue(TEXT("Marker clear succeeds"), LoreOperationMarker::Clear(Root));
+	TestFalse(TEXT("A cleared marker reads as no operation"), LoreOperationMarker::Read(Root).IsValid());
+
+	// A record written without the branch fields (an older marker) still reads: the added fields default empty.
+	FLoreOperationMarker Minimal;
+	Minimal.Kind = ELoreOperationKind::RevisionSync;
+	Minimal.SourceRevision = TEXT("cccc");
+	TestTrue(TEXT("Minimal marker write succeeds"), LoreOperationMarker::Write(Root, Minimal));
+	const FLoreOperationMarker MinimalReadBack = LoreOperationMarker::Read(Root);
+	TestTrue(TEXT("A marker without branch fields reads"), MinimalReadBack.IsValid());
+	TestEqual(TEXT("Minimal kind round-trips"), (int32)MinimalReadBack.Kind, (int32)ELoreOperationKind::RevisionSync);
+	TestTrue(TEXT("Absent target branch reads empty"), MinimalReadBack.TargetBranch.IsEmpty());
+	LoreOperationMarker::Clear(Root);
+
+	// Clearing an absent marker is a no-op success.
+	TestTrue(TEXT("Clearing an absent marker succeeds"), LoreOperationMarker::Clear(Root));
+
+	return true;
+}
+
+#if LORE_UE5_3_OR_LATER
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistClassTest, "LoreSourceControl.Changelist.IdentifierAndState", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistClassTest::RunTest(const FString& Parameters)
+{
+	FLoreSourceControlChangelistRef Default = MakeShared<FLoreSourceControlChangelist, ESPMode::ThreadSafe>(FString(LoreChangelists::DefaultId));
+	TestTrue(TEXT("Default changelist reports default"), Default->IsDefault());
+	TestFalse(TEXT("Default changelist cannot be deleted"), Default->CanDelete());
+	TestEqual(TEXT("Default identifier round-trips"), Default->GetIdentifier(), FString(LoreChangelists::DefaultId));
+
+	FLoreSourceControlChangelistRef Named = MakeShared<FLoreSourceControlChangelist, ESPMode::ThreadSafe>(FString(TEXT("cl-1")));
+	TestFalse(TEXT("Named changelist is not default"), Named->IsDefault());
+	TestTrue(TEXT("Named changelist can be deleted"), Named->CanDelete());
+
+	FLoreSourceControlChangelistStateRef State = MakeShared<FLoreSourceControlChangelistState, ESPMode::ThreadSafe>(Named);
+	State->Title = TEXT("Feature work");
+	State->Description = TEXT("Work in progress");
+	TestEqual(TEXT("Display text is the title"), State->GetDisplayText().ToString(), FString(TEXT("Feature work")));
+	TestEqual(TEXT("Description text round-trips"), State->GetDescriptionText().ToString(), FString(TEXT("Work in progress")));
+	TestEqual(TEXT("A fresh changelist has no files"), State->GetFilesStates().Num(), 0);
+	TestEqual(TEXT("The state's changelist round-trips"), State->GetChangelist()->GetIdentifier(), FString(TEXT("cl-1")));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreProviderChangelistsTest, "LoreSourceControl.Changelist.ProviderGetChangelists", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreProviderChangelistsTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreProviderCL"), TEXT("pcl"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	// Seed a named changelist in the store alongside the mandatory Default.
+	TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Fixture.Root);
+	FLoreChangelistRecord Feature;
+	Feature.Id = TEXT("cl-1");
+	Feature.Title = TEXT("Feature");
+	Records.Add(Feature);
+	TestTrue(TEXT("Seed save succeeds"), LoreChangelists::Save(Fixture.Root, Records));
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const TArray<FSourceControlChangelistRef> Changelists = Provider.GetChangelists(EStateCacheUsage::Use);
+	bool bHasDefault = false;
+	bool bHasFeature = false;
+	for (const FSourceControlChangelistRef& Changelist : Changelists)
+	{
+		const FString Id = Changelist->GetIdentifier();
+		bHasDefault |= (Id == LoreChangelists::DefaultId);
+		bHasFeature |= (Id == TEXT("cl-1"));
+	}
+	TestTrue(TEXT("The provider lists the Default changelist"), bHasDefault);
+	TestTrue(TEXT("The provider lists the seeded changelist"), bHasFeature);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistWorkersTest, "LoreSourceControl.Changelist.WorkerRoundTrip", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistWorkersTest::RunTest(const FString& Parameters)
+{
+	// The changelist workers edit only the plugin store, so a bare temporary root stands in for a working tree and no server runs.
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreChangelistWorkers"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	ISourceControlModule& SourceControl = ISourceControlModule::Get();
+	const FName Previous = SourceControl.GetProvider().GetName();
+	SourceControl.SetProvider(FName("Lore"));
+	ON_SCOPE_EXIT { SourceControl.SetProvider(Previous); };
+	FLoreSourceControlProvider& LoreProvider = FLoreSourceControlModule::Get().GetProvider();
+	LoreProvider.Init();
+	LoreProvider.SetRepositoryInfo(true, true, Root, FString(), TEXT("test@example.com"), TEXT("main"), FString(), TEXT("test"));
+	ISourceControlProvider& Provider = SourceControl.GetProvider();
+
+	auto RecordOf = [&Root](const FString& Id) -> FLoreChangelistRecord
+	{
+		const TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Root);
+		const FLoreChangelistRecord* Found = Records.FindByPredicate([&Id](const FLoreChangelistRecord& R) { return R.Id == Id; });
+		return Found ? *Found : FLoreChangelistRecord();
+	};
+	auto ProviderLists = [&Provider](const FString& Id) -> bool
+	{
+		for (const FSourceControlChangelistRef& Changelist : Provider.GetChangelists(EStateCacheUsage::Use))
+		{
+			if (Changelist->GetIdentifier() == Id)
+			{
+				return true;
+			}
+		}
+		return false;
+	};
+
+	// New changelist: the worker mints a record carrying the description and hands the identifier back on the operation.
+	TSharedRef<FNewChangelist, ESPMode::ThreadSafe> NewOperation = ISourceControlOperation::Create<FNewChangelist>();
+	NewOperation->SetDescription(FText::FromString(TEXT("Lighting pass\nRebake the hero level")));
+	TestEqual(TEXT("NewChangelist through the provider succeeds"), (int32)Provider.Execute(NewOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	const FSourceControlChangelistPtr Created = NewOperation->GetNewChangelist();
+	TestTrue(TEXT("NewChangelist hands back the created changelist"), Created.IsValid());
+	if (!Created.IsValid())
+	{
+		return false;
+	}
+	const FString CreatedId = Created->GetIdentifier();
+	{
+		const FLoreChangelistRecord Record = RecordOf(CreatedId);
+		TestEqual(TEXT("The created record carries the description"), Record.Description, FString(TEXT("Lighting pass\nRebake the hero level")));
+		TestEqual(TEXT("The title is the description's first line"), Record.Title, FString(TEXT("Lighting pass")));
+		// The command snapshots the settings identity override when one is saved on this machine, else the provider identity.
+		FString ExpectedIdentity = FLoreSourceControlModule::Get().GetSettings().GetIdentity();
+		if (ExpectedIdentity.IsEmpty())
+		{
+			ExpectedIdentity = TEXT("test@example.com");
+		}
+		TestEqual(TEXT("The author is the command identity"), Record.Author, ExpectedIdentity);
+	}
+	TestTrue(TEXT("GetChangelists lists the created changelist"), ProviderLists(CreatedId));
+
+	// Edit rewrites the description, and the title follows its first line.
+	TSharedRef<FEditChangelist, ESPMode::ThreadSafe> EditOperation = ISourceControlOperation::Create<FEditChangelist>();
+	EditOperation->SetDescription(FText::FromString(TEXT("Lighting and fog pass")));
+	TestEqual(TEXT("EditChangelist through the provider succeeds"), (int32)Provider.Execute(EditOperation, Created, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	TestEqual(TEXT("Edit rewrites the description"), RecordOf(CreatedId).Description, FString(TEXT("Lighting and fog pass")));
+	TestEqual(TEXT("Edit rewrites the title"), RecordOf(CreatedId).Title, FString(TEXT("Lighting and fog pass")));
+
+	// Move-to: seed Default with two files, then move one into the created changelist and back.
+	{
+		TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Root);
+		FLoreChangelistRecord* Default = Records.FindByPredicate([](const FLoreChangelistRecord& R) { return R.IsDefault(); });
+		Default->Files = { TEXT("Content/A.uasset"), TEXT("Content/B.uasset") };
+		TestTrue(TEXT("Seeding Default's files succeeds"), LoreChangelists::Save(Root, Records));
+	}
+	const FString FileA = Root / TEXT("Content/A.uasset");
+	TestEqual(TEXT("MoveToChangelist out of Default succeeds"), (int32)Provider.Execute(ISourceControlOperation::Create<FMoveToChangelist>(), Created, TArray<FString>{ FileA }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	TestTrue(TEXT("The moved file joins the destination"), RecordOf(CreatedId).Files.Contains(TEXT("Content/A.uasset")));
+	TestFalse(TEXT("The moved file leaves Default"), RecordOf(LoreChangelists::DefaultId).Files.Contains(TEXT("Content/A.uasset")));
+	TestTrue(TEXT("The unmoved file stays in Default"), RecordOf(LoreChangelists::DefaultId).Files.Contains(TEXT("Content/B.uasset")));
+
+	FSourceControlChangelistPtr DefaultChangelist;
+	for (const FSourceControlChangelistRef& Changelist : Provider.GetChangelists(EStateCacheUsage::Use))
+	{
+		if (Changelist->IsDefault())
+		{
+			DefaultChangelist = Changelist;
+		}
+	}
+	TestTrue(TEXT("GetChangelists yields the Default changelist"), DefaultChangelist.IsValid());
+	TestEqual(TEXT("MoveToChangelist back into Default succeeds"), (int32)Provider.Execute(ISourceControlOperation::Create<FMoveToChangelist>(), DefaultChangelist, TArray<FString>{ FileA }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	TestTrue(TEXT("The file returns to Default"), RecordOf(LoreChangelists::DefaultId).Files.Contains(TEXT("Content/A.uasset")));
+	TestFalse(TEXT("The file leaves the named changelist"), RecordOf(CreatedId).Files.Contains(TEXT("Content/A.uasset")));
+
+	// New changelist with files carries them out of their previous changelist, the editor's move-to-new-changelist action.
+	TSharedRef<FNewChangelist, ESPMode::ThreadSafe> CarryOperation = ISourceControlOperation::Create<FNewChangelist>();
+	CarryOperation->SetDescription(FText::FromString(TEXT("Carved out")));
+	TestEqual(TEXT("NewChangelist with files succeeds"), (int32)Provider.Execute(CarryOperation, FSourceControlChangelistPtr(), TArray<FString>{ FileA }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	const FString CarryId = CarryOperation->GetNewChangelist().IsValid() ? CarryOperation->GetNewChangelist()->GetIdentifier() : FString();
+	TestTrue(TEXT("The carried file joins the new changelist"), RecordOf(CarryId).Files.Contains(TEXT("Content/A.uasset")));
+	TestFalse(TEXT("The carried file leaves Default"), RecordOf(LoreChangelists::DefaultId).Files.Contains(TEXT("Content/A.uasset")));
+
+	// Update pending changelists status succeeds; the live reconciliation lands with the GetState changelist surface.
+	TSharedRef<FUpdatePendingChangelistsStatus, ESPMode::ThreadSafe> UpdateOperation = ISourceControlOperation::Create<FUpdatePendingChangelistsStatus>();
+	UpdateOperation->SetUpdateAllChangelists(true);
+	TestEqual(TEXT("UpdateChangelistsStatus through the provider succeeds"), (int32)Provider.Execute(UpdateOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	// Delete removes the named changelist and refuses the Default changelist.
+	TestEqual(TEXT("DeleteChangelist through the provider succeeds"), (int32)Provider.Execute(ISourceControlOperation::Create<FDeleteChangelist>(), Created, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	TestFalse(TEXT("The deleted changelist is gone from the store"), LoreChangelists::Load(Root).ContainsByPredicate([&CreatedId](const FLoreChangelistRecord& R) { return R.Id == CreatedId; }));
+	TestFalse(TEXT("GetChangelists no longer lists the deleted changelist"), ProviderLists(CreatedId));
+
+	TestEqual(TEXT("Deleting the Default changelist is refused"), (int32)Provider.Execute(ISourceControlOperation::Create<FDeleteChangelist>(), DefaultChangelist, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Failed);
+	TestTrue(TEXT("The Default changelist survives the refused delete"), ProviderLists(LoreChangelists::DefaultId));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistGetStateTest, "LoreSourceControl.Changelist.GetStateReconciles", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistGetStateTest::RunTest(const FString& Parameters)
+{
+	// GetState reconciles membership against the provider's cached file states, so a bare temporary root and a seeded cache stand in for a working tree and no server runs.
+	const FString Root = FPaths::Combine(FString(FPlatformProcess::UserTempDir()), TEXT("LoreChangelistGetState"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+
+	ISourceControlModule& SourceControl = ISourceControlModule::Get();
+	const FName Previous = SourceControl.GetProvider().GetName();
+	SourceControl.SetProvider(FName("Lore"));
+	ON_SCOPE_EXIT { SourceControl.SetProvider(Previous); };
+	FLoreSourceControlProvider& LoreProvider = FLoreSourceControlModule::Get().GetProvider();
+	LoreProvider.Init();
+	LoreProvider.SetRepositoryInfo(true, true, Root, FString(), TEXT("test@example.com"), TEXT("main"), FString(), TEXT("test"));
+	ISourceControlProvider& Provider = SourceControl.GetProvider();
+
+	// Seed a named changelist holding A, so the reconciliation must keep the explicit assignment.
+	{
+		TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Root);
+		FLoreChangelistRecord Feature;
+		Feature.Id = TEXT("cl-1");
+		Feature.Title = TEXT("Feature");
+		Feature.Files = { TEXT("Content/A.uasset") };
+		Records.Add(Feature);
+		TestTrue(TEXT("Seed save succeeds"), LoreChangelists::Save(Root, Records));
+	}
+
+	// Seed the state cache: A and B changed, C unchanged.
+	const FString FileA = FPaths::ConvertRelativePathToFull(Root / TEXT("Content/A.uasset"));
+	const FString FileB = FPaths::ConvertRelativePathToFull(Root / TEXT("Content/B.uasset"));
+	const FString FileC = FPaths::ConvertRelativePathToFull(Root / TEXT("Content/C.uasset"));
+	{
+		TArray<FLoreSourceControlState> Seeded;
+		FLoreSourceControlState StateA(FileA);
+		StateA.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		FLoreSourceControlState StateB(FileB);
+		StateB.WorkingCopyState = ELoreWorkingCopyState::Modified;
+		FLoreSourceControlState StateC(FileC);
+		StateC.WorkingCopyState = ELoreWorkingCopyState::Unchanged;
+		Seeded.Add(StateA);
+		Seeded.Add(StateB);
+		Seeded.Add(StateC);
+		LoreSourceControlUtils::UpdateCachedStates(Seeded);
+	}
+
+	TArray<FSourceControlChangelistStateRef> States;
+	TestEqual(TEXT("GetState over the changelists succeeds"), (int32)Provider.GetState(Provider.GetChangelists(EStateCacheUsage::Use), States, EStateCacheUsage::Use), (int32)ECommandResult::Succeeded);
+
+	auto FilesOf = [&States](const FString& Id) -> TArray<FString>
+	{
+		TArray<FString> Files;
+		for (const FSourceControlChangelistStateRef& State : States)
+		{
+			if (State->GetChangelist()->GetIdentifier() == Id)
+			{
+				for (const FSourceControlStateRef& File : State->GetFilesStates())
+				{
+					Files.Add(File->GetFilename());
+				}
+			}
+		}
+		return Files;
+	};
+
+	TestTrue(TEXT("The explicit assignment stays in its changelist"), FilesOf(TEXT("cl-1")).Contains(FileA));
+	TestTrue(TEXT("The unassigned changed file joins Default"), FilesOf(LoreChangelists::DefaultId).Contains(FileB));
+	TestFalse(TEXT("The assigned file is not duplicated into Default"), FilesOf(LoreChangelists::DefaultId).Contains(FileA));
+	TestFalse(TEXT("An unchanged file joins no changelist"), FilesOf(LoreChangelists::DefaultId).Contains(FileC) || FilesOf(TEXT("cl-1")).Contains(FileC));
+
+	// The member file states resolve to the cached live states, so the Changes view shows real status.
+	for (const FSourceControlChangelistStateRef& State : States)
+	{
+		if (State->GetChangelist()->GetIdentifier() == FString(LoreChangelists::DefaultId))
+		{
+			for (const FSourceControlStateRef& File : State->GetFilesStates())
+			{
+				TestTrue(TEXT("A member file state resolves to the cached modified state"), File->IsModified());
+			}
+		}
+	}
+
+	// The reconciled membership persists, so a changelist-keyed submit expands to the set the view showed.
+	const TArray<FLoreChangelistRecord> Persisted = LoreChangelists::Load(Root);
+	const FLoreChangelistRecord* PersistedDefault = Persisted.FindByPredicate([](const FLoreChangelistRecord& R) { return R.IsDefault(); });
+	TestTrue(TEXT("Default's reconciled membership persists to the store"), PersistedDefault && PersistedDefault->Files.Contains(TEXT("Content/B.uasset")));
+
+	// A changelist submit with no member files is refused rather than committing the whole staged set.
+	{
+		TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Root);
+		FLoreChangelistRecord Empty;
+		Empty.Id = TEXT("cl-empty");
+		Empty.Title = TEXT("Empty");
+		Records.Add(Empty);
+		TestTrue(TEXT("Empty changelist seed saves"), LoreChangelists::Save(Root, Records));
+	}
+	FSourceControlChangelistPtr EmptyChangelist;
+	for (const FSourceControlChangelistRef& Changelist : Provider.GetChangelists(EStateCacheUsage::Use))
+	{
+		if (Changelist->GetIdentifier() == TEXT("cl-empty"))
+		{
+			EmptyChangelist = Changelist;
+		}
+	}
+	TestTrue(TEXT("The empty changelist is listed"), EmptyChangelist.IsValid());
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> EmptySubmit = ISourceControlOperation::Create<FCheckIn>();
+	EmptySubmit->SetDescription(FText::FromString(TEXT("empty changelist submit")));
+	TestEqual(TEXT("Submitting an empty changelist is refused"), (int32)Provider.Execute(EmptySubmit, EmptyChangelist, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Failed);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistSubmitTest, "LoreSourceControl.Changelist.SubmitMemberFiles", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistSubmitTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreChangelistSubmit"), TEXT("clsub"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const FString FileMember = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("member.txt"));
+	const FString FileOutsider = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("outsider.txt"));
+	FFileHelper::SaveStringToFile(TEXT("member"), *FileMember);
+	FFileHelper::SaveStringToFile(TEXT("outsider"), *FileOutsider);
+	TestEqual(TEXT("MarkForAdd stages both files"), (int32)Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), TArray<FString>{ FileMember, FileOutsider }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	// Carve the member file into its own changelist; the outsider stays for Default.
+	TSharedRef<FNewChangelist, ESPMode::ThreadSafe> NewOperation = ISourceControlOperation::Create<FNewChangelist>();
+	NewOperation->SetDescription(FText::FromString(TEXT("Member submit")));
+	TestEqual(TEXT("NewChangelist succeeds"), (int32)Provider.Execute(NewOperation, FSourceControlChangelistPtr(), TArray<FString>{ FileMember }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	const FSourceControlChangelistPtr Created = NewOperation->GetNewChangelist();
+	if (!Created.IsValid())
+	{
+		AddError(TEXT("NewChangelist returned no changelist."));
+		return false;
+	}
+	const FString CreatedId = Created->GetIdentifier();
+
+	// A render pass, so the reconciliation collects the outsider into Default and persists the membership the submit will expand.
+	TArray<FSourceControlChangelistStateRef> States;
+	TestEqual(TEXT("GetState over the changelists succeeds"), (int32)Provider.GetState(Provider.GetChangelists(EStateCacheUsage::Use), States, EStateCacheUsage::Use), (int32)ECommandResult::Succeeded);
+	for (const FSourceControlChangelistStateRef& State : States)
+	{
+		if (State->GetChangelist()->GetIdentifier() == CreatedId)
+		{
+			TestEqual(TEXT("The named changelist holds exactly the member file"), State->GetFilesStates().Num(), 1);
+		}
+	}
+	{
+		const TArray<FLoreChangelistRecord> Reconciled = LoreChangelists::Load(Fixture.Root);
+		const FLoreChangelistRecord* Default = Reconciled.FindByPredicate([](const FLoreChangelistRecord& R) { return R.IsDefault(); });
+		TestTrue(TEXT("The outsider is collected into Default"), Default && Default->Files.Contains(TEXT("outsider.txt")));
+	}
+
+	// Submit the changelist by identifier with no file list, the Changes view path.
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> Submit = ISourceControlOperation::Create<FCheckIn>();
+	Submit->SetDescription(FText::FromString(TEXT("changelist member submit")));
+	TestEqual(TEXT("Changelist-keyed submit succeeds"), (int32)Provider.Execute(Submit, Created, TArray<FString>(), EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	TestFalse(TEXT("Changelist submit sets a non-empty success message"), Submit->GetSuccessMessage().IsEmpty());
+
+	// Exactly the member file committed: it reads source controlled while the outsider stays uncommitted.
+	TArray<FSourceControlStateRef> FileStates;
+	TestEqual(TEXT("Status refresh after the submit succeeds"), (int32)Provider.GetState(TArray<FString>{ FileMember, FileOutsider }, FileStates, EStateCacheUsage::ForceUpdate), (int32)ECommandResult::Succeeded);
+	for (const FSourceControlStateRef& State : FileStates)
+	{
+		if (State->GetFilename() == FileMember)
+		{
+			TestTrue(TEXT("The member file is committed"), State->IsSourceControlled() && !State->IsAdded());
+		}
+		if (State->GetFilename() == FileOutsider)
+		{
+			TestFalse(TEXT("The outsider file is not committed"), State->IsSourceControlled());
+		}
+	}
+
+	// The submitted record empties and goes away, the reference provider's implicit delete of a submitted named changelist. Default's membership is not asserted here: the partial submit unstages the outsider, so it reads not controlled and a later reconciliation drops it from Default.
+	const TArray<FLoreChangelistRecord> Records = LoreChangelists::Load(Fixture.Root);
+	TestFalse(TEXT("The submitted changelist record is gone"), Records.ContainsByPredicate([&CreatedId](const FLoreChangelistRecord& R) { return R.Id == CreatedId; }));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLoreChangelistSubmitExpandsAtIssueTest, "LoreSourceControl.Changelist.SubmitExpandsAtIssue", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FLoreChangelistSubmitExpandsAtIssueTest::RunTest(const FString& Parameters)
+{
+	FLoreTestFixture Fixture(*this, TEXT("LoreChangelistExpand"), TEXT("clexp"));
+	if (!Fixture.bReady)
+	{
+		return false;
+	}
+
+	FName Previous;
+	ISourceControlProvider& Provider = BeginProviderOn(Fixture, Previous);
+	ON_SCOPE_EXIT { ISourceControlModule::Get().SetProvider(Previous); };
+
+	const FString FileMember = FPaths::ConvertRelativePathToFull(Fixture.Root / TEXT("member.txt"));
+	FFileHelper::SaveStringToFile(TEXT("member"), *FileMember);
+	TestEqual(TEXT("MarkForAdd stages the file"), (int32)Provider.Execute(ISourceControlOperation::Create<FMarkForAdd>(), TArray<FString>{ FileMember }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+
+	TSharedRef<FNewChangelist, ESPMode::ThreadSafe> NewOperation = ISourceControlOperation::Create<FNewChangelist>();
+	NewOperation->SetDescription(FText::FromString(TEXT("Expansion site")));
+	TestEqual(TEXT("NewChangelist succeeds"), (int32)Provider.Execute(NewOperation, FSourceControlChangelistPtr(), TArray<FString>{ FileMember }, EConcurrency::Synchronous), (int32)ECommandResult::Succeeded);
+	const FSourceControlChangelistPtr Created = NewOperation->GetNewChangelist();
+	if (!Created.IsValid())
+	{
+		AddError(TEXT("NewChangelist returned no changelist."));
+		return false;
+	}
+
+	// Pin the expansion site: issue the changelist-keyed submit while this thread holds the store lock, then empty the membership before releasing it. The command's file list fills at issue time on this thread, so the mid-flight edit cannot change what commits; a worker that re-read the store on the pool thread would serialize behind this mutate and find the record empty.
+	TSharedRef<FCheckIn, ESPMode::ThreadSafe> Submit = ISourceControlOperation::Create<FCheckIn>();
+	Submit->SetDescription(FText::FromString(TEXT("expansion site submit")));
+	bool bDone = false;
+	ECommandResult::Type Result = ECommandResult::Failed;
+	LoreChangelists::Mutate(Fixture.Root, [&Provider, &Submit, &Created, &bDone, &Result](TArray<FLoreChangelistRecord>& Records)
+	{
+		Provider.Execute(Submit, Created, TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateLambda([&bDone, &Result](const FSourceControlOperationRef&, ECommandResult::Type InResult)
+		{
+			bDone = true;
+			Result = InResult;
+		}));
+		FLoreChangelistRecord* Record = Records.FindByPredicate([&Created](const FLoreChangelistRecord& R) { return R.Id == Created->GetIdentifier(); });
+		if (Record)
+		{
+			Record->Files.Empty();
+		}
+		return true;
+	});
+
+	const double StartSeconds = FPlatformTime::Seconds();
+	while (!bDone && FPlatformTime::Seconds() - StartSeconds < 120.0)
+	{
+		Provider.Tick();
+		FPlatformProcess::Sleep(0.01f);
+	}
+	TestTrue(TEXT("The asynchronous submit completes"), bDone);
+	TestEqual(TEXT("The submit succeeds on the issue-time expansion"), (int32)Result, (int32)ECommandResult::Succeeded);
+
+	// The member file committed even though its record emptied mid-flight, so the expansion ran at issue time.
+	TArray<FSourceControlStateRef> FileStates;
+	TestEqual(TEXT("Status refresh succeeds"), (int32)Provider.GetState(TArray<FString>{ FileMember }, FileStates, EStateCacheUsage::ForceUpdate), (int32)ECommandResult::Succeeded);
+	for (const FSourceControlStateRef& State : FileStates)
+	{
+		TestTrue(TEXT("The member file is committed"), State->IsSourceControlled() && !State->IsAdded());
+	}
+
+	return true;
+}
+#endif // LORE_UE5_3_OR_LATER
 
 #endif // WITH_DEV_AUTOMATION_TESTS

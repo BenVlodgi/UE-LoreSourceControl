@@ -42,10 +42,11 @@ public class LoreSourceControl : ModuleRules
 				PrivateDependencyModuleNames.Add("ContentBrowser");
 			}
 
-			// The submit-dialog title override binds a SourceControlWindows delegate added in UE 5.8.
-			if (Target.Version.MajorVersion > 5 || (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 8))
+			// The branches window and history browser are gated to 5.1. They reuse the engine history window (SourceControlWindows) and copy to the clipboard (ApplicationCore). The submit-dialog title override at 5.8 also lives in SourceControlWindows, so the 5.1 floor covers both.
+			if (Target.Version.MajorVersion > 5 || (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 1))
 			{
 				PrivateDependencyModuleNames.Add("SourceControlWindows");
+				PrivateDependencyModuleNames.Add("ApplicationCore");
 			}
 		}
 

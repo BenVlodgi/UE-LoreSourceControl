@@ -214,7 +214,8 @@ bool FLoreSourceControlState::CanCheckIn() const
 
 bool FLoreSourceControlState::CanCheckout() const
 {
-	if (!bUsingLocking)
+	// Check out acquires a lock, which needs the server. Offline, the editor offers make-writable instead, so this reads false and the check-out action grays out.
+	if (!bUsingLocking || !bRemoteAvailable)
 	{
 		return false;
 	}

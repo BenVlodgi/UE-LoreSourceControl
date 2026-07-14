@@ -11,6 +11,7 @@
 #include "ISourceControlChangelistState.h"
 #endif
 #include "LoreSourceControlState.h"
+#include "LoreOperationMarker.h"
 #include "ILoreSourceControlWorker.h"
 
 class FLoreSourceControlCommand;
@@ -96,6 +97,9 @@ public:
 	/** Register a worker with the provider, so it can map an operation name to the work. */
 	void RegisterWorker(const FName& InName, const FGetLoreSourceControlWorker& InDelegate);
 
+	/** Whether an operation of this name has a registered worker, so a menu entry can gate on a guarded operation's arrival on every engine version, where CanExecuteOperation exists only from 5.3. */
+	bool IsOperationRegistered(const FName& InOperationName) const;
+
 	/** Path to Lore binary */
 	inline const FString& GetLoreBinaryPath() const
 	{
@@ -162,6 +166,21 @@ public:
 	/** Store whether the remote is reachable and the client is authorized. Game thread only. */
 	void SetRemoteAuthState(bool bInRemoteAvailable, bool bInRemoteAuthorized);
 
+	/** Read this instance's operation marker and, when one is present, record it as a pending recovery. Runs at connect and after a failed guarded rewrite, the two ways a torn tree surfaces. Game thread only. */
+	void DetectInterruptedRewrite();
+
+	/** Whether an interrupted rewrite is waiting for the user's recovery choice. */
+	bool HasPendingRecovery() const { return PendingRecovery.IsValid(); }
+
+	/** The pending recovery's marker, valid only while HasPendingRecovery. */
+	const FLoreOperationMarker& GetPendingRecovery() const { return PendingRecovery; }
+
+	/** Repair the tree the pending marker describes and re-run the recorded operation: scan the marker's changed files, reset the ones the scan flags dirty back to the anchor, then re-dispatch the recorded rewrite, whose guard runs again with a fresh marker. Clears the pending state. Returns true when the tree ends consistent. Game thread. */
+	bool PerformRecovery();
+
+	/** Clear the pending marker and leave the half-applied files as ordinary local modifications for the user to inspect. Game thread. */
+	void DismissRecovery();
+
 	/** Helper function used to update the state cache */
 	TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& InFilename);
 
@@ -175,6 +194,11 @@ private:
 
 	/** Handle for the package-saved delegate, released on Close. */
 	FDelegateHandle OnPackageSavedHandle;
+
+#if SOURCE_CONTROL_WITH_SLATE
+	/** Raise the interrupted-rewrite notification with Recover and Dismiss. Called from Tick so the notification system is up. */
+	void RaiseRecoveryNotification();
+#endif
 
 	/** Helper function for Execute() */
 	TSharedPtr<ILoreSourceControlWorker, ESPMode::ThreadSafe> CreateWorker(const FName& InOperationName) const;
@@ -220,6 +244,12 @@ private:
 
 	/** Client authorized on the remote; false means the server requires a sign-in the client lacks */
 	bool bRemoteAuthorized = true;
+
+	/** Marker of an interrupted rewrite awaiting the user's recovery choice; invalid when none is pending */
+	FLoreOperationMarker PendingRecovery;
+
+	/** Whether the recovery notification has been raised for the current pending recovery, so Tick raises it once */
+	bool bRecoveryNotificationShown = false;
 
 	/** State cache, keyed by absolute filename */
 	TMap<FString, TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>> StateCache;

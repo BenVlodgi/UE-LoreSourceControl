@@ -8,6 +8,7 @@
 #include "LoreSourceControlProvider.h"
 #include "LoreSourceControlVersion.h"
 #include "LoreSourceControlMenu.h"
+#include "LoreSourceControlWindows.h"
 
 class FLoreSourceControlModule : public IModuleInterface
 {
@@ -37,5 +38,6 @@ private:
 	FLoreSourceControlProvider Provider;
 #if WITH_EDITOR && LORE_UE5_1_OR_LATER
 	FLoreSourceControlMenu AssetMenu;
+	FLoreSourceControlWindows Windows;
 #endif
 };

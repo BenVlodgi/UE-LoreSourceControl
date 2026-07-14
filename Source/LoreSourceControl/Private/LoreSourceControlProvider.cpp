@@ -6,6 +6,13 @@
 #include "LoreSourceControlUtils.h"
 #include "LoreSourceControlOperations.h"
 #include "LoreSourceControlDownload.h"
+#include "LoreSourceControlLog.h"
+#include "LoreGuardedRewrite.h"
+#include "LoreOperationMarker.h"
+#include "LorePluginStore.h"
+#include "LoreChangelistStore.h"
+#include "LoreSourceControlChangelist.h"
+#include "LoreSourceControlChangelistState.h"
 #include "ISourceControlModule.h"
 #include "SourceControlOperations.h"
 #include "SourceControlHelpers.h"
@@ -59,6 +66,8 @@ void FLoreSourceControlProvider::Init(bool bForceConnection)
 		// Read identity and remote before any status query, so our own locks attribute right.
 		LoreSourceControlUtils::GetRepositoryConfig(PathToRepositoryRoot, RemoteUrl, Identity);
 		LoreSourceControlUtils::GetBranchName(Mode, PathToLoreBinary, PathToRepositoryRoot, BranchName);
+		// A marker left over from a rewrite that took the editor down surfaces here on the next start.
+		DetectInterruptedRewrite();
 	}
 
 	if (!OnPackageSavedHandle.IsValid())
@@ -194,7 +203,73 @@ ECommandResult::Type FLoreSourceControlProvider::GetState(const TArray<FString>&
 #if LORE_UE5_0_OR_LATER
 ECommandResult::Type FLoreSourceControlProvider::GetState(const TArray<FSourceControlChangelistRef>& InChangelists, TArray<FSourceControlChangelistStateRef>& OutState, EStateCacheUsage::Type InStateCacheUsage)
 {
+	// The changelist surface needs ISourceControlChangelist's 5.3 methods, so below 5.3 there is no changelist state to return.
+#if LORE_UE5_3_OR_LATER
+	if (!IsEnabled())
+	{
+		return ECommandResult::Failed;
+	}
+
+	// Membership reconciliation runs here on the game thread, where the state cache lives, and the reconciled records persist so a changelist-keyed submit expands to the same set the view shows. The store read is live, so a force update has nothing extra to refresh. IsModified covers exactly the changed working-copy states; an out-of-tree cache entry (engine content the editor queried) never joins a changelist.
+	FString RootPrefix = FPaths::ConvertRelativePathToFull(PathToRepositoryRoot);
+	FPaths::NormalizeDirectoryName(RootPrefix);
+	RootPrefix += TEXT("/");
+	TArray<FString> ChangedFiles;
+	for (const auto& Pair : StateCache)
+	{
+		if (Pair.Key.StartsWith(RootPrefix) && Pair.Value->IsModified())
+		{
+			ChangedFiles.Add(LoreSourceControlUtils::RelativeFilename(Pair.Key, PathToRepositoryRoot));
+		}
+	}
+
+	// The whole load-reconcile-save runs under the store lock, so a worker's pool-thread edit cannot land in between and be lost.
+	TArray<FLoreChangelistRecord> Records;
+	LoreChangelists::Mutate(PathToRepositoryRoot, [this, &ChangedFiles, &Records](TArray<FLoreChangelistRecord>& StoreRecords)
+	{
+		// A member whose live state is unknown (absent from the cache, or cached before any status query) counts as changed so Reconcile keeps it: the editor reads changelist state before the first status pass, and dropping on unknown would wipe every assignment at startup. Only a member known to be not changed drops out.
+		for (const FLoreChangelistRecord& Record : StoreRecords)
+		{
+			for (const FString& RelativeFile : Record.Files)
+			{
+				const TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe>* Found = StateCache.Find(FPaths::ConvertRelativePathToFull(PathToRepositoryRoot / RelativeFile));
+				if (!Found || (*Found)->WorkingCopyState == ELoreWorkingCopyState::Unknown)
+				{
+					ChangedFiles.Add(RelativeFile);
+				}
+			}
+		}
+
+		// The cache carries no move source, so a move reconciles as its destination joining Default.
+		LoreChangelists::Reconcile(StoreRecords, ChangedFiles, TMap<FString, FString>());
+		Records = StoreRecords;
+		return true;
+	});
+
+	for (const FSourceControlChangelistRef& InChangelist : InChangelists)
+	{
+		const FString Id = InChangelist->GetIdentifier();
+		FLoreSourceControlChangelistStateRef State = MakeShared<FLoreSourceControlChangelistState, ESPMode::ThreadSafe>(MakeShared<FLoreSourceControlChangelist, ESPMode::ThreadSafe>(Id));
+		// A stale identifier whose record is gone yields an empty state rather than failing the whole query.
+		if (const FLoreChangelistRecord* Record = Records.FindByPredicate([&Id](const FLoreChangelistRecord& R) { return R.Id == Id; }))
+		{
+			State->Title = Record->Title;
+			State->Description = Record->Description;
+			if (Record->Updated != FDateTime::MinValue())
+			{
+				State->TimeStamp = Record->Updated;
+			}
+			for (const FString& RelativeFile : Record->Files)
+			{
+				State->Files.Add(GetStateInternal(FPaths::ConvertRelativePathToFull(PathToRepositoryRoot / RelativeFile)));
+			}
+		}
+		OutState.Add(State);
+	}
+	return ECommandResult::Succeeded;
+#else
 	return ECommandResult::Failed;
+#endif
 }
 #endif
 
@@ -247,6 +322,28 @@ ECommandResult::Type FLoreSourceControlProvider::Execute(const TSharedRef<ISourc
 #if LORE_UE5_0_OR_LATER
 	Command->Changelist = InChangelist;
 #endif
+#if LORE_UE5_3_OR_LATER
+	if (InChangelist.IsValid())
+	{
+		Command->ChangelistId = InChangelist->GetIdentifier();
+	}
+
+	// The Changes view submits a changelist by identifier with no file list. Expand the membership here, at issue time on the game thread under the store lock, so the submitted set is exactly what the view rendered; the worker does not re-read the store on the pool thread, where a concurrent edit could change the set mid-flight.
+	if (Command->Files.Num() == 0 && !Command->ChangelistId.IsEmpty() && (InOperation->GetName() == "CheckIn" || InOperation->GetName() == "CheckInOverLock"))
+	{
+		for (const FLoreChangelistRecord& Record : LoreChangelists::Load(PathToRepositoryRoot))
+		{
+			if (Record.Id == Command->ChangelistId)
+			{
+				for (const FString& RelativeFile : Record.Files)
+				{
+					Command->Files.Add(FPaths::ConvertRelativePathToFull(PathToRepositoryRoot / RelativeFile));
+				}
+				break;
+			}
+		}
+	}
+#endif
 
 	if (InConcurrency == EConcurrency::Synchronous)
 	{
@@ -282,7 +379,17 @@ TArray<TSharedRef<ISourceControlLabel>> FLoreSourceControlProvider::GetLabels(co
 #if LORE_UE5_0_OR_LATER
 TArray<FSourceControlChangelistRef> FLoreSourceControlProvider::GetChangelists(EStateCacheUsage::Type InStateCacheUsage)
 {
+	// The changelist surface needs ISourceControlChangelist's 5.3 methods, so on 5.0 through 5.2 there are no changelists and the uncontrolled-changelist fallback stands.
+#if LORE_UE5_3_OR_LATER
+	TArray<FSourceControlChangelistRef> Result;
+	for (const FLoreChangelistRecord& Record : LoreChangelists::Load(PathToRepositoryRoot))
+	{
+		Result.Add(MakeShared<FLoreSourceControlChangelist, ESPMode::ThreadSafe>(Record.Id));
+	}
+	return Result;
+#else
 	return TArray<FSourceControlChangelistRef>();
+#endif
 }
 #endif
 
@@ -293,12 +400,18 @@ bool FLoreSourceControlProvider::UsesLocalReadOnlyState() const
 
 bool FLoreSourceControlProvider::UsesChangelists() const
 {
+	// Real changelists need the 5.3 changelist interface; below that only the uncontrolled-changelist fallback stands.
+#if LORE_UE5_3_OR_LATER
+	return true;
+#else
 	return false;
+#endif
 }
 
 #if LORE_UE5_2_OR_LATER
 bool FLoreSourceControlProvider::UsesUncontrolledChangelists() const
 {
+	// Kept on alongside real changelists, matching the Perforce and Plastic providers.
 	return true;
 }
 #endif
@@ -382,6 +495,15 @@ void FLoreSourceControlProvider::Tick()
 	{
 		OnSourceControlStateChanged.Broadcast();
 	}
+
+#if SOURCE_CONTROL_WITH_SLATE
+	// Raise the recovery notification from Tick, not from Init: Init can run during editor boot before the notification system is up. Raise it once per pending recovery.
+	if (PendingRecovery.IsValid() && !bRecoveryNotificationShown)
+	{
+		bRecoveryNotificationShown = true;
+		RaiseRecoveryNotification();
+	}
+#endif
 }
 
 #if SOURCE_CONTROL_WITH_SLATE
@@ -757,6 +879,11 @@ void FLoreSourceControlProvider::RegisterWorker(const FName& InName, const FGetL
 	WorkersMap.Add(InName, InDelegate);
 }
 
+bool FLoreSourceControlProvider::IsOperationRegistered(const FName& InOperationName) const
+{
+	return WorkersMap.Contains(InOperationName);
+}
+
 void FLoreSourceControlProvider::SetRepositoryInfo(bool bInAvailable, bool bInRepositoryFound, const FString& InRepositoryRoot, const FString& InRemoteUrl, const FString& InIdentity, const FString& InBranchName, const FString& InRepositoryId, const FString& InLoreVersion)
 {
 	bLoreAvailable = bInAvailable;
@@ -774,6 +901,156 @@ void FLoreSourceControlProvider::SetRemoteAuthState(bool bInRemoteAvailable, boo
 	bRemoteAvailable = bInRemoteAvailable;
 	bRemoteAuthorized = bInRemoteAuthorized;
 }
+
+void FLoreSourceControlProvider::DetectInterruptedRewrite()
+{
+	check(IsInGameThread());
+	if (PendingRecovery.IsValid() || PathToRepositoryRoot.IsEmpty())
+	{
+		return;
+	}
+
+	const FLoreOperationMarker Marker = LoreOperationMarker::Read(PathToRepositoryRoot);
+	if (!Marker.IsValid())
+	{
+		return;
+	}
+
+	// A marker from a different working tree's instance belongs to that tree; leave it alone. Read() keys by this instance already, so a mismatch means the marker predates instance keying or came from a shared unkeyed file; only adopt it when it names this instance or carries none.
+	const FString Instance = LorePluginStore::ReadInstanceId(PathToRepositoryRoot);
+	if (!Marker.Instance.IsEmpty() && !Instance.IsEmpty() && Marker.Instance != Instance)
+	{
+		return;
+	}
+
+	PendingRecovery = Marker;
+	bRecoveryNotificationShown = false;
+}
+
+bool FLoreSourceControlProvider::PerformRecovery()
+{
+	check(IsInGameThread());
+	if (!PendingRecovery.IsValid())
+	{
+		return true;
+	}
+
+	const FLoreOperationMarker Marker = PendingRecovery;
+	const ELoreBackendMode Mode = FLoreSourceControlModule::Get().GetSettings().GetBackendMode();
+	const bool bUsingLocking = FLoreSourceControlModule::Get().GetSettings().IsUsingLocking();
+
+	// Clear the pending state first so the re-dispatched sync's own guard, which writes and clears a fresh marker, is not read back as a new interruption.
+	PendingRecovery = FLoreOperationMarker();
+	bRecoveryNotificationShown = false;
+
+	// Reset the flagged-dirty delta files back to the anchor. A plain re-run does not repair a torn tree, and a dirty file inside a delta refuses the re-run, so the reset comes first.
+	bool bAnyReset = false;
+	TArray<FString> RepairErrors;
+	const bool bRepaired = LoreGuardedRewrite::RepairTornFiles(Marker, Mode, PathToLoreBinary, PathToRepositoryRoot, Identity, bUsingLocking, bAnyReset, RepairErrors);
+	if (!bRepaired)
+	{
+		LoreOperationMarker::Clear(PathToRepositoryRoot);
+		return false;
+	}
+
+	// Re-dispatch the recorded operation through the normal worker path, whose guard runs again with a fresh marker and clears it on a verified success. When nothing was dirty the rewrite had completed, so there is nothing to re-run.
+	//
+	// Three-way discriminator, keyed by the marker fields, not the kind alone:
+	//   - a non-empty target branch re-dispatches the branch switch to that branch;
+	//   - a non-empty target revision with an empty target branch re-dispatches a move to that revision (the move worker is a later chunk, so absent it, log and leave the reset files for the manual path);
+	//   - an empty target branch and an empty target revision re-dispatch FSync to the tip, the shipped sync case.
+	// Keying on the fields keeps the sync arm safe: a shipped sync leaves both empty and must sync to the tip, while a move records a specific revision and must return to it, not carry the tree forward.
+	bool bReDispatched = true;
+	if (bAnyReset && !Marker.TargetBranch.IsEmpty())
+	{
+		TSharedRef<FLoreSwitchBranch, ESPMode::ThreadSafe> Switch = ISourceControlOperation::Create<FLoreSwitchBranch>();
+		Switch->BranchName = Marker.TargetBranch;
+#if LORE_UE5_0_OR_LATER
+		bReDispatched = Execute(Switch, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Synchronous) == ECommandResult::Succeeded;
+#else
+		bReDispatched = Execute(Switch, TArray<FString>(), EConcurrency::Synchronous) == ECommandResult::Succeeded;
+#endif
+	}
+	else if (bAnyReset && !Marker.TargetRevision.IsEmpty())
+	{
+		// A move to a specific revision. The move worker ships in a later chunk; until it registers, the reset has already returned the files to the anchor, so leave them for the user to move by hand rather than syncing the tree forward past the recorded revision.
+		if (IsOperationRegistered("MoveToRevision"))
+		{
+			// The move re-dispatch is wired with the move worker; guarding on registration keeps this branch inert until then.
+			UE_LOG(LogLoreSourceControl, Warning, TEXT("Interrupted move recovery: MoveToRevision registered but its re-dispatch is not wired yet; the reset restored the files, move to %s by hand."), *Marker.TargetRevision);
+		}
+		else
+		{
+			UE_LOG(LogLoreSourceControl, Warning, TEXT("Interrupted move recovery: the files were reset to the anchor. Move to revision %s by hand; the guarded move ships in a later 0.4/0.5 chunk."), *Marker.TargetRevision);
+		}
+	}
+	else if (bAnyReset && Marker.Kind == ELoreOperationKind::RevisionSync)
+	{
+		TArray<FString> Files;
+		for (const FString& Relative : Marker.ChangedFiles)
+		{
+			Files.Add(FPaths::ConvertRelativePathToFull(PathToRepositoryRoot / Relative));
+		}
+#if LORE_UE5_0_OR_LATER
+		bReDispatched = Execute(ISourceControlOperation::Create<FSync>(), FSourceControlChangelistPtr(), Files, EConcurrency::Synchronous) == ECommandResult::Succeeded;
+#else
+		bReDispatched = Execute(ISourceControlOperation::Create<FSync>(), Files, EConcurrency::Synchronous) == ECommandResult::Succeeded;
+#endif
+	}
+
+	// The re-dispatched operation clears its own marker on success. Clear here too, so a nothing-to-do recovery or a re-dispatch that never ran leaves no marker behind.
+	LoreOperationMarker::Clear(PathToRepositoryRoot);
+	return bReDispatched;
+}
+
+void FLoreSourceControlProvider::DismissRecovery()
+{
+	check(IsInGameThread());
+	PendingRecovery = FLoreOperationMarker();
+	bRecoveryNotificationShown = false;
+	LoreOperationMarker::Clear(PathToRepositoryRoot);
+}
+
+#if SOURCE_CONTROL_WITH_SLATE
+void FLoreSourceControlProvider::RaiseRecoveryNotification()
+{
+	// The operation names itself in the message, the target and file count give the user what they need to judge whether the interrupted rewrite carried merged work they would lose to a reset.
+	const FString OperationName = PendingRecovery.Kind == ELoreOperationKind::BranchSwitch ? TEXT("branch switch")
+		: PendingRecovery.Kind == ELoreOperationKind::ReturnToLatest ? TEXT("return to latest")
+		: TEXT("sync");
+	const FText Message = FText::Format(
+		LOCTEXT("RecoveryOffer", "A Lore {0} was interrupted, leaving {1} {1}|plural(one=file,other=files) half-updated. Recover returns them to the pre-{0} revision first, discarding any local edit the interrupted operation merged in."),
+		FText::FromString(OperationName), FText::AsNumber(PendingRecovery.ChangedFiles.Num()));
+
+	FNotificationInfo Info(Message);
+	Info.bFireAndForget = false;
+	Info.FadeOutDuration = 0.5f;
+	Info.ExpireDuration = 0.0f;
+
+	// The button lambdas close the persistent notification, so they need its item; a shared holder captures it after AddNotification returns.
+	TSharedRef<TSharedPtr<SNotificationItem>> ItemHolder = MakeShared<TSharedPtr<SNotificationItem>>();
+
+	Info.ButtonDetails.Add(FNotificationButtonInfo(
+		LOCTEXT("RecoverButton", "Recover"),
+		LOCTEXT("RecoverButtonTip", "Reset the half-updated files to the pre-operation revision, then re-run the operation."),
+		FSimpleDelegate::CreateLambda([this, ItemHolder]()
+		{
+			if (ItemHolder->IsValid()) { (*ItemHolder)->SetFadeOutDuration(0.5f); (*ItemHolder)->ExpireAndFadeout(); }
+			PerformRecovery();
+		})));
+
+	Info.ButtonDetails.Add(FNotificationButtonInfo(
+		LOCTEXT("DismissButton", "Dismiss"),
+		LOCTEXT("DismissButtonTip", "Leave the half-updated files as ordinary local modifications to inspect by hand."),
+		FSimpleDelegate::CreateLambda([this, ItemHolder]()
+		{
+			if (ItemHolder->IsValid()) { (*ItemHolder)->ExpireAndFadeout(); }
+			DismissRecovery();
+		})));
+
+	*ItemHolder = FSlateNotificationManager::Get().AddNotification(Info);
+}
+#endif
 
 TSharedRef<FLoreSourceControlState, ESPMode::ThreadSafe> FLoreSourceControlProvider::GetStateInternal(const FString& InFilename)
 {

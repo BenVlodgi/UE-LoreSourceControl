@@ -101,12 +101,15 @@ namespace
 		return Out;
 	}
 
+	// Every accumulator ignores error and complete events after a complete with status 0: a server that answers and then challenges authentication emits a trailing error plus a second complete with status 1, and the command-line parsers already skip that tail. bCompletedOk records the successful complete.
+
 	// Terminal and diagnostic events shared by every call; a mutation needs nothing more than these.
 	struct FTerminalContext
 	{
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics;
 	};
 
@@ -120,6 +123,10 @@ namespace
 		switch (Event->tag)
 		{
 			case LORE_EVENT_ERROR:
+				if (Context->bCompletedOk)
+				{
+					break;
+				}
 				Context->bError = true;
 				Context->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Context->Diagnostics.Add(Context->ErrorMessage);
@@ -131,7 +138,11 @@ namespace
 				}
 				break;
 			case LORE_EVENT_COMPLETE:
-				Context->CompleteStatus = Event->complete.status;
+				if (!Context->bCompletedOk)
+				{
+					Context->CompleteStatus = Event->complete.status;
+					Context->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			default:
 				break;
@@ -157,6 +168,7 @@ namespace
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics; // liblore warning and error log text, surfaced when a call fails
 	};
 
@@ -177,6 +189,10 @@ namespace
 				Accumulator->Result->bRemoteAvailable = Revision.remote_available != 0;
 				Accumulator->Result->bRemoteAuthorized = Revision.remote_authorized != 0;
 				Accumulator->Result->BranchName = StringFromLore(Revision.branch_name);
+				Accumulator->Result->CurrentRevision = HashToHex(Revision.revision);
+				Accumulator->Result->CurrentRevisionNumber = static_cast<int32>(Revision.revision_number);
+				Accumulator->Result->RemoteRevision = HashToHex(Revision.revision_remote);
+				Accumulator->Result->RemoteRevisionNumber = static_cast<int32>(Revision.revision_remote_number);
 				break;
 			}
 			case LORE_EVENT_REPOSITORY_STATUS_FILE:
@@ -195,6 +211,10 @@ namespace
 			}
 			case LORE_EVENT_ERROR:
 			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
 				Accumulator->bError = true;
 				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
@@ -210,7 +230,11 @@ namespace
 			}
 			case LORE_EVENT_COMPLETE:
 			{
-				Accumulator->CompleteStatus = Event->complete.status;
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			}
 			default:
@@ -224,6 +248,7 @@ namespace
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics;
 	};
 
@@ -248,6 +273,10 @@ namespace
 			}
 			case LORE_EVENT_ERROR:
 			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
 				Accumulator->bError = true;
 				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
@@ -263,7 +292,11 @@ namespace
 			}
 			case LORE_EVENT_COMPLETE:
 			{
-				Accumulator->CompleteStatus = Event->complete.status;
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			}
 			default:
@@ -278,6 +311,7 @@ namespace
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics;
 	};
 
@@ -303,6 +337,10 @@ namespace
 			}
 			case LORE_EVENT_ERROR:
 			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
 				Accumulator->bError = true;
 				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
@@ -318,7 +356,11 @@ namespace
 			}
 			case LORE_EVENT_COMPLETE:
 			{
-				Accumulator->CompleteStatus = Event->complete.status;
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			}
 			default:
@@ -333,6 +375,7 @@ namespace
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics;
 	};
 
@@ -383,6 +426,10 @@ namespace
 			}
 			case LORE_EVENT_ERROR:
 			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
 				Accumulator->bError = true;
 				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
@@ -398,13 +445,346 @@ namespace
 			}
 			case LORE_EVENT_COMPLETE:
 			{
-				Accumulator->CompleteStatus = Event->complete.status;
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			}
 			default:
 				break;
 		}
 	}
+
+	// timestamp, message, and committed-by fill the given fields; created-by seeds the author until the committer arrives.
+	void ApplyMetadata(const lore_metadata_event_data_t& InMeta, FDateTime& OutDate, FString& OutMessage, FString& OutAuthor)
+	{
+		const FString Key = StringFromLore(InMeta.key);
+		if (Key == TEXT("timestamp") && InMeta.value.tag == LORE_METADATA_NUMERIC)
+		{
+			OutDate = FDateTime::FromUnixTimestamp(static_cast<int64>(InMeta.value.numeric / 1000));
+		}
+		else if (Key == TEXT("message") && InMeta.value.tag == LORE_METADATA_STRING)
+		{
+			OutMessage = StringFromLore(InMeta.value.string);
+		}
+		else if ((Key == TEXT("committed-by") || (Key == TEXT("created-by") && OutAuthor.IsEmpty())) && InMeta.value.tag == LORE_METADATA_STRING)
+		{
+			OutAuthor = StringFromLore(InMeta.value.string);
+		}
+	}
+
+	// One synchronous revision-history call's events accumulate here. REVISION_HISTORY_ENTRY starts an entry; the library streams the revision's metadata right after it, though the header's event table omits that.
+	struct FRevisionListAccumulator
+	{
+		TArray<LoreClient::FRevisionEntry>* Revisions = nullptr;
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
+		TArray<FString> Diagnostics;
+	};
+
+	void RevisionListEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FRevisionListAccumulator* Accumulator = reinterpret_cast<FRevisionListAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator || !Accumulator->Revisions)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_REVISION_HISTORY_ENTRY:
+			{
+				const lore_revision_history_entry_event_data_t& Entry = Event->revision_history_entry;
+				LoreClient::FRevisionEntry Out;
+				Out.Hash = HashToHex(Entry.revision);
+				Out.RevisionNumber = static_cast<int32>(Entry.revision_number);
+				Out.ParentHash = HashToHex(Entry.parent[0]);
+				Out.ParentOtherHash = HashToHex(Entry.parent[1]);
+				Accumulator->Revisions->Add(MoveTemp(Out));
+				break;
+			}
+			case LORE_EVENT_METADATA:
+			{
+				if (Accumulator->Revisions->Num() == 0)
+				{
+					break;
+				}
+				LoreClient::FRevisionEntry& Current = Accumulator->Revisions->Last();
+				ApplyMetadata(Event->metadata, Current.Date, Current.Message, Current.Author);
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	// One synchronous revision-info call's events accumulate here. REVISION_INFO carries the header, METADATA the commit fields, and each REVISION_INFO_DELTA one changed path.
+	struct FRevisionInfoAccumulator
+	{
+		LoreClient::FRevisionDetails* Details = nullptr;
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
+		TArray<FString> Diagnostics;
+	};
+
+	void RevisionInfoEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FRevisionInfoAccumulator* Accumulator = reinterpret_cast<FRevisionInfoAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator || !Accumulator->Details)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_REVISION_INFO:
+			{
+				const lore_revision_info_event_data_t& Info = Event->revision_info;
+				Accumulator->Details->Hash = HashToHex(Info.revision);
+				Accumulator->Details->RevisionNumber = static_cast<int32>(Info.revision_number);
+				break;
+			}
+			case LORE_EVENT_METADATA:
+			{
+				ApplyMetadata(Event->metadata, Accumulator->Details->Date, Accumulator->Details->Message, Accumulator->Details->Author);
+				break;
+			}
+			case LORE_EVENT_REVISION_INFO_DELTA:
+			{
+				const lore_revision_info_delta_event_data_t& Delta = Event->revision_info_delta;
+				LoreClient::FRevisionDelta Out;
+				Out.Path = StringFromLore(Delta.path);
+				Out.Action = ActionToken(Delta.action);
+				Out.Size = static_cast<int64>(Delta.size);
+				Out.bModified = Delta.flag_modify != 0;
+				Out.bMerged = Delta.flag_merged != 0;
+				Out.bIsFile = Delta.flag_file != 0;
+				Accumulator->Details->Deltas.Add(MoveTemp(Out));
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	// One synchronous branch-list call's events accumulate here. Each BRANCH_LIST_ENTRY adds a branch; begin and end frame the stream.
+	struct FBranchListAccumulator
+	{
+		TArray<LoreClient::FBranchInfo>* Branches = nullptr;
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
+		TArray<FString> Diagnostics;
+	};
+
+	void BranchListEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FBranchListAccumulator* Accumulator = reinterpret_cast<FBranchListAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator || !Accumulator->Branches)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_BRANCH_LIST_ENTRY:
+			{
+				const lore_branch_list_entry_event_data_t& Entry = Event->branch_list_entry;
+				LoreClient::FBranchInfo Out;
+				Out.Name = StringFromLore(Entry.name);
+				Out.Category = StringFromLore(Entry.category);
+				Out.Creator = StringFromLore(Entry.creator);
+				Out.LatestHash = HashToHex(Entry.latest);
+				Out.Created = FDateTime::FromUnixTimestamp(static_cast<int64>(Entry.created / 1000));
+				Out.bIsCurrent = Entry.is_current != 0;
+				Out.bArchived = Entry.archived != 0;
+				Out.bIsRemote = Entry.location != LORE_BRANCH_LOCATION_LOCAL;
+				Accumulator->Branches->Add(MoveTemp(Out));
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	// One branch-metadata-get call's events accumulate here. A METADATA event carries the requested key and its tagged value; a missing key emits no METADATA event, so bFound stays false.
+	struct FBranchMetadataAccumulator
+	{
+		FString Key;         // key being read, so a metadata event for another key is ignored
+		FString* Value = nullptr;
+		bool* Found = nullptr;
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
+		TArray<FString> Diagnostics;
+	};
+
+	// Render a metadata value as text: boolean as "true"/"false", numeric decimal, string verbatim, and a hash or address as hex. Only boolean is load-bearing for the protect key; the rest keep the reader total.
+	FString MetadataValueToString(const lore_metadata_t& InValue)
+	{
+		switch (InValue.tag)
+		{
+			case LORE_METADATA_BOOLEAN: return InValue.boolean != 0 ? TEXT("true") : TEXT("false");
+			case LORE_METADATA_NUMERIC: return FString::Printf(TEXT("%llu"), static_cast<unsigned long long>(InValue.numeric));
+			case LORE_METADATA_STRING:  return StringFromLore(InValue.string);
+			case LORE_METADATA_HASH:    return HashToHex(InValue.hash);
+			case LORE_METADATA_ADDRESS: return AddressToString(InValue.address);
+			default:                    return FString();
+		}
+	}
+
+	void BranchMetadataEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FBranchMetadataAccumulator* Accumulator = reinterpret_cast<FBranchMetadataAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_METADATA:
+			{
+				const lore_metadata_event_data_t& Meta = Event->metadata;
+				if (StringFromLore(Meta.key) != Accumulator->Key)
+				{
+					break;
+				}
+				if (Accumulator->Value)
+				{
+					*Accumulator->Value = MetadataValueToString(Meta.value);
+				}
+				if (Accumulator->Found)
+				{
+					*Accumulator->Found = true;
+				}
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
 	// One synchronous auth call's events accumulate here. AUTH_USER_INFO carries the resolved identity; AUTH_URL carries the login URL in no-browser interactive mode.
 	struct FAuthAccumulator
 	{
@@ -413,6 +793,7 @@ namespace
 		bool bError = false;
 		FString ErrorMessage;
 		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
 		TArray<FString> Diagnostics;
 	};
 
@@ -445,6 +826,10 @@ namespace
 			}
 			case LORE_EVENT_ERROR:
 			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
 				Accumulator->bError = true;
 				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
 				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
@@ -460,7 +845,79 @@ namespace
 			}
 			case LORE_EVENT_COMPLETE:
 			{
-				Accumulator->CompleteStatus = Event->complete.status;
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	// One dry-run sync's per-file delta accumulates here. Each REVISION_SYNC_FILE names one file the sync would touch; under the dry_run global flag nothing on disk changes.
+	struct FSyncDeltaAccumulator
+	{
+		TArray<LoreClient::FSyncDeltaFile>* Delta = nullptr;
+		bool bError = false;
+		FString ErrorMessage;
+		int32 CompleteStatus = 0;
+		bool bCompletedOk = false;
+		TArray<FString> Diagnostics;
+	};
+
+	void SyncDeltaEventCallback(const lore_event_t* Event, uint64_t UserContext)
+	{
+		FSyncDeltaAccumulator* Accumulator = reinterpret_cast<FSyncDeltaAccumulator*>(static_cast<UPTRINT>(UserContext));
+		if (!Event || !Accumulator || !Accumulator->Delta)
+		{
+			return;
+		}
+
+		switch (Event->tag)
+		{
+			case LORE_EVENT_REVISION_SYNC_FILE:
+			{
+				const lore_revision_sync_file_event_data_t& File = Event->revision_sync_file;
+				// Directory entries carry no content to rewrite, so keep only files in the delta.
+				if (File.flag_file == 0)
+				{
+					break;
+				}
+				LoreClient::FSyncDeltaFile Out;
+				Out.Path = StringFromLore(File.path);
+				Out.Action = ActionToken(File.action);
+				Accumulator->Delta->Add(MoveTemp(Out));
+				break;
+			}
+			case LORE_EVENT_ERROR:
+			{
+				if (Accumulator->bCompletedOk)
+				{
+					break;
+				}
+				Accumulator->bError = true;
+				Accumulator->ErrorMessage = StringFromLore(Event->error.error_inner);
+				Accumulator->Diagnostics.Add(Accumulator->ErrorMessage);
+				break;
+			}
+			case LORE_EVENT_LOG:
+			{
+				if (Event->log.level >= LORE_LOG_LEVEL_WARN)
+				{
+					Accumulator->Diagnostics.Add(StringFromLore(Event->log.message));
+				}
+				break;
+			}
+			case LORE_EVENT_COMPLETE:
+			{
+				if (!Accumulator->bCompletedOk)
+				{
+					Accumulator->CompleteStatus = Event->complete.status;
+					Accumulator->bCompletedOk = Event->complete.status == 0;
+				}
 				break;
 			}
 			default:
@@ -653,6 +1110,137 @@ namespace LoreClient
 		return true;
 	}
 
+	bool BranchList(const FString& InRepositoryRoot, bool bIncludeArchived, TArray<FBranchInfo>& OutBranches, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_branch_list_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.archived = bIncludeArchived ? 1 : 0;
+
+		FBranchListAccumulator Accumulator;
+		Accumulator.Branches = &OutBranches;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &BranchListEventCallback;
+
+		const int32 Code = lore_branch_list(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_branch_list failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool BranchMetadataGet(const FString& InRepositoryRoot, const FString& InBranch, const FString& InKey, FString& OutValue, bool& bOutFound, FString& OutError)
+	{
+		OutValue.Empty();
+		bOutFound = false;
+
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+		FLoreUtf8 Key(InKey);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_branch_metadata_get_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		if (!InBranch.IsEmpty()) { Args.branch = Branch.View(); }
+		Args.key = Key.View();
+
+		FBranchMetadataAccumulator Accumulator;
+		Accumulator.Key = InKey;
+		Accumulator.Value = &OutValue;
+		Accumulator.Found = &bOutFound;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &BranchMetadataEventCallback;
+
+		const int32 Code = lore_branch_metadata_get(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_branch_metadata_get failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool RevisionList(const FString& InRepositoryRoot, const FString& InBranch, const FString& InStartRevision, int32 InLength, TArray<FRevisionEntry>& OutRevisions, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+		FLoreUtf8 StartRevision(InStartRevision);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_revision_history_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		if (!InStartRevision.IsEmpty()) { Args.revision = StartRevision.View(); }
+		if (!InBranch.IsEmpty()) { Args.branch = Branch.View(); }
+		Args.length = InLength > 0 ? static_cast<uint32_t>(InLength) : 0;
+
+		FRevisionListAccumulator Accumulator;
+		Accumulator.Revisions = &OutRevisions;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &RevisionListEventCallback;
+
+		const int32 Code = lore_revision_history(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_revision_history failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool RevisionInfo(const FString& InRepositoryRoot, const FString& InRevision, bool bIncludeDelta, FRevisionDetails& OutDetails, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Revision(InRevision);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_revision_info_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		if (!InRevision.IsEmpty()) { Args.revision = Revision.View(); }
+		Args.delta = bIncludeDelta ? 1 : 0;
+		Args.metadata = 1;
+
+		FRevisionInfoAccumulator Accumulator;
+		Accumulator.Details = &OutDetails;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &RevisionInfoEventCallback;
+
+		const int32 Code = lore_revision_info(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_revision_info failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
 	bool Stage(const FString& InRepositoryRoot, const TArray<FString>& InRelativePaths, FString& OutError)
 	{
 		FLoreUtf8 RepositoryPath(InRepositoryRoot);
@@ -838,6 +1426,171 @@ namespace LoreClient
 
 		const int32 Code = lore_revision_sync(&Globals, &Args, Callback);
 		return TerminalSucceeded(Context, Code, TEXT("lore_revision_sync"), OutError);
+	}
+
+	bool EnumerateSyncDelta(const FString& InRepositoryRoot, TArray<FSyncDeltaFile>& OutDelta, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+		// Dry run: report the delta and touch nothing. The same realization the switch dry-run drives, verified against sync.rs:595,917.
+		Globals.dry_run = 1;
+
+		lore_revision_sync_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+
+		FSyncDeltaAccumulator Accumulator;
+		Accumulator.Delta = &OutDelta;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &SyncDeltaEventCallback;
+
+		const int32 Code = lore_revision_sync(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_revision_sync (dry run) failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool EnumerateSwitchDelta(const FString& InRepositoryRoot, const FString& InBranch, const FString& InRevision, TArray<FSyncDeltaFile>& OutDelta, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+		FLoreUtf8 Revision(InRevision);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+		// Dry run: the switch reports the delta and touches nothing, the same realization the sync dry-run drives.
+		Globals.dry_run = 1;
+
+		lore_branch_switch_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.branch = Branch.View();
+		if (!InRevision.IsEmpty()) { Args.revision = Revision.View(); }
+
+		FSyncDeltaAccumulator Accumulator;
+		Accumulator.Delta = &OutDelta;
+
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Accumulator));
+		Callback.func = &SyncDeltaEventCallback;
+
+		const int32 Code = lore_branch_switch(&Globals, &Args, Callback);
+		if (Code != 0 || Accumulator.bError || Accumulator.CompleteStatus != 0)
+		{
+			const FString Detail = Accumulator.Diagnostics.Num() ? FString::Join(Accumulator.Diagnostics, TEXT("; ")) : Accumulator.ErrorMessage;
+			OutError = FString::Printf(TEXT("lore_branch_switch (dry run) failed (return %d, status %d): %s"), Code, Accumulator.CompleteStatus, *Detail);
+			return false;
+		}
+		return true;
+	}
+
+	bool BranchCreate(const FString& InRepositoryRoot, const FString& InName, const FString& InCategory, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Name(InName);
+		FLoreUtf8 Category(InCategory);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_branch_create_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.branch = Name.View();
+		if (!InCategory.IsEmpty()) { Args.category = Category.View(); }
+
+		FTerminalContext Context;
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Context));
+		Callback.func = &TerminalEventCallback;
+
+		const int32 Code = lore_branch_create(&Globals, &Args, Callback);
+		return TerminalSucceeded(Context, Code, TEXT("lore_branch_create"), OutError);
+	}
+
+	bool BranchSwitch(const FString& InRepositoryRoot, const FString& InBranch, const FString& InRevision, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+		FLoreUtf8 Revision(InRevision);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_branch_switch_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.branch = Branch.View();
+		if (!InRevision.IsEmpty()) { Args.revision = Revision.View(); }
+		// Never reset or bare: a conflicting dirty file must refuse the switch, not be overwritten.
+
+		FTerminalContext Context;
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Context));
+		Callback.func = &TerminalEventCallback;
+
+		const int32 Code = lore_branch_switch(&Globals, &Args, Callback);
+		return TerminalSucceeded(Context, Code, TEXT("lore_branch_switch"), OutError);
+	}
+
+	bool BranchArchive(const FString& InRepositoryRoot, const FString& InBranch, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		lore_branch_archive_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.branch = Branch.View();
+
+		FTerminalContext Context;
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Context));
+		Callback.func = &TerminalEventCallback;
+
+		const int32 Code = lore_branch_archive(&Globals, &Args, Callback);
+		return TerminalSucceeded(Context, Code, TEXT("lore_branch_archive"), OutError);
+	}
+
+	bool BranchSetProtect(const FString& InRepositoryRoot, const FString& InBranch, bool bProtect, FString& OutError)
+	{
+		FLoreUtf8 RepositoryPath(InRepositoryRoot);
+		FLoreUtf8 Branch(InBranch);
+
+		lore_global_args_t Globals;
+		FMemory::Memzero(&Globals, sizeof(Globals));
+		Globals.repository_path = RepositoryPath.View();
+
+		FTerminalContext Context;
+		lore_event_callback_config_t Callback;
+		Callback.user_context = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(&Context));
+		Callback.func = &TerminalEventCallback;
+
+		int32 Code = 0;
+		if (bProtect)
+		{
+			lore_branch_protect_args_t Args;
+			FMemory::Memzero(&Args, sizeof(Args));
+			Args.branch = Branch.View();
+			Code = lore_branch_protect(&Globals, &Args, Callback);
+			return TerminalSucceeded(Context, Code, TEXT("lore_branch_protect"), OutError);
+		}
+		lore_branch_unprotect_args_t Args;
+		FMemory::Memzero(&Args, sizeof(Args));
+		Args.branch = Branch.View();
+		Code = lore_branch_unprotect(&Globals, &Args, Callback);
+		return TerminalSucceeded(Context, Code, TEXT("lore_branch_unprotect"), OutError);
 	}
 
 	bool WriteFile(const FString& InRepositoryRoot, const FString& InRelativeFile, const FString& InRevision, const FString& InOutputPath, FString& OutError)

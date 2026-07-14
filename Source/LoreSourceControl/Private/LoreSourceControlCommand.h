@@ -79,6 +79,10 @@ public:
 	/** Target changelist, if any */
 	FSourceControlChangelistPtr Changelist;
 #endif
+#if LORE_UE5_3_OR_LATER
+	/** Target changelist identifier snapshotted at dispatch, so the worker thread never reads the shared changelist object */
+	FString ChangelistId;
+#endif
 
 	TArray<FString> InfoMessages;
 	TArray<FString> ErrorMessages;

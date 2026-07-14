@@ -115,6 +115,9 @@ public:
 	/** Whether the locking workflow is active for this state. */
 	bool bUsingLocking = false;
 
+	/** Whether the remote was reachable at the status pass that produced this state. When false, check out is unavailable since a lock cannot be acquired. */
+	bool bRemoteAvailable = true;
+
 	/** Revision history, populated when an update requests it. */
 	TLoreSourceControlHistory History;
 
